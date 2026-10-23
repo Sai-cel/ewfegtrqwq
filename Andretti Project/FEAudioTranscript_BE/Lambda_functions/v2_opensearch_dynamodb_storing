@@ -1,0 +1,1424 @@
+############# 16/07/2026 ############
+"""
+OpenSearch & DynamoDB Lambda
+Processes transcription results and indexes into OpenSearch + DynamoDB.
+Pushes real-time updates to WebSocket clients.
+
+Triggered by: S3 event (new transcription JSON files)
+
+Features:
+- Text-based deduplication using MD5 hash
+- Session ID extraction from S3 path
+- Driver metadata lookup from S3
+- Real-time WebSocket push to connected clients
+- Presigned URL generation for audio playback
+
+Author: People Tech Group
+Updated: December 29, 2024
+"""
+
+import boto3
+import json
+import os
+import time
+import uuid
+import urllib.parse
+import re
+import hashlib
+import tempfile
+import io
+from datetime import datetime
+
+from botocore.exceptions import ClientError
+from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+
+try:
+    import numpy as np
+    import librosa
+    VOICE_FINGERPRINTING_ENABLED = True
+    print("Voice fingerprinting libraries loaded successfully")
+except ImportError as e:
+    VOICE_FINGERPRINTING_ENABLED = False
+    print(f"Voice fingerprinting disabled - missing libraries: {e}")
+
+
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "test-v2-andretti-transcription-system")
+
+INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "transcriptions/")
+SILENCE_REMOVED_PREFIX = os.environ.get("SILENCE_REMOVED_PREFIX", "silence-removed/")
+RAW_CHUNKS_PREFIX = os.environ.get("RAW_CHUNKS_PREFIX", "raw-chunks/")
+
+LOG_PREFIX = "logs/indexing/"
+
+OPENSEARCH_HOST = os.environ.get("OPENSEARCH_HOST", "search-andretti-fe-dev-to-indexing-tpuwdbzpfw6jz5g4z5rou2ab5q.aos.us-west-2.on.aws")
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "v2_transcriptions")
+
+DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "v2_texthash-table")
+
+ACTIVE_SESSIONS_TABLE = os.environ.get("ACTIVE_SESSIONS_TABLE", "v2_ActiveSessions")
+
+SPEAKER_PROFILES_TABLE = os.environ.get("SPEAKER_PROFILES_TABLE", "v2_SpeakerProfiles")
+
+WEBSOCKET_CONNECTIONS_TABLE = os.environ.get("WEBSOCKET_CONNECTIONS_TABLE", "v2_websocket-connections")
+WEBSOCKET_ENDPOINT = os.environ.get("WEBSOCKET_ENDPOINT", "")
+LIVE_CONVERSATION_WINDOW_SECONDS = int(os.environ.get("LIVE_CONVERSATION_WINDOW_SECONDS", "120"))
+
+SEGMENT_TIME_SECONDS = int(os.environ.get("SEGMENT_TIME_SECONDS", 10))
+
+print("OpenSearch/DynamoDB Lambda initialized")
+
+
+
+s3_client = boto3.client('s3')
+dynamodb_client = boto3.resource('dynamodb')
+dynamodb_table = dynamodb_client.Table(DYNAMODB_TABLE_NAME)
+ws_connections_table = dynamodb_client.Table(WEBSOCKET_CONNECTIONS_TABLE)
+
+AUDIT_S3_BUCKET = os.environ.get('AUDIT_S3_BUCKET', 'test-v2-andretti-audit-logs')
+AUDIT_S3_PREFIX = os.environ.get('AUDIT_S3_PREFIX', 'audit-logs/')
+SESSION_LOGS_PREFIX = os.environ.get('SESSION_LOGS_PREFIX', 'session_logs/')
+SYSTEM_LOGS_PREFIX = os.environ.get('SYSTEM_LOGS_PREFIX', 'system_logs/')
+SESSION_SCOPED_ENTITIES = {'pipeline', 'session', 'session_config', 'recording'}
+
+
+def record_audit_event(action, entity, entity_id, created_by, details=None):
+    """Write an audit-trail record to S3 in three places: a date partition
+    (unchanged), session_logs/{session_id}/ for session-scoped entities (this
+    Lambda's events are all entity='pipeline', so always here), or
+    system_logs/YYYY/MM/DD/ otherwise. No-op if AUDIT_S3_BUCKET is unset;
+    never raises."""
+    if not AUDIT_S3_BUCKET:
+        return
+    try:
+        now = datetime.utcnow()
+        record = {
+            'audit_id': str(uuid.uuid4()),
+            'timestamp': now.isoformat() + 'Z',
+            'action': action,
+            'entity': entity,
+            'entity_id': str(entity_id) if entity_id is not None else '',
+            'created_by': created_by or 'unknown',
+            'details': details or {}
+        }
+        suffix = f"{action}_{int(now.timestamp())}_{record['audit_id'][:8]}.json"
+        body = json.dumps(record, default=str).encode('utf-8')
+        date_path = now.strftime('%Y/%m/%d')
+        s3_client.put_object(
+            Bucket=AUDIT_S3_BUCKET,
+            Key=f"{AUDIT_S3_PREFIX}{date_path}/{suffix}",
+            Body=body,
+            ContentType='application/json'
+        )
+        if entity in SESSION_SCOPED_ENTITIES and record['entity_id']:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SESSION_LOGS_PREFIX}{record['entity_id']}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+        else:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SYSTEM_LOGS_PREFIX}{date_path}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+    except Exception as e:
+        print(f"[AUDIT] Failed to record {action} for {entity}:{entity_id}: {e}")
+speaker_profiles_table = dynamodb_client.Table(SPEAKER_PROFILES_TABLE)
+
+# session = boto3.session.Session()
+# credentials = session.get_credentials()
+# region = session.region_name or 'us-west-2'
+# awsauth = AWSV4SignerAuth(credentials, region, 'es')
+
+# Authenticate to OpenSearch with the same basic-auth user the query Lambdas
+# use. The IAM/SigV4 path only works on a domain whose access policy / FGAC maps
+# this Lambda's execution role; on the test domain that mapping is absent, so
+# SigV4 writes 403 and nothing gets indexed. Basic auth with the domain's
+# internal user works on both. Set OPENSEARCH_USERNAME/PASSWORD per environment.
+def _get_opensearch_credentials():
+    client = boto3.client("secretsmanager", region_name="us-west-2")
+    response = client.get_secret_value(SecretId="andretti/opensearch-credentials")
+    return json.loads(response["SecretString"])
+
+_creds = _get_opensearch_credentials()
+OPENSEARCH_USERNAME = _creds["username"]
+OPENSEARCH_PASSWORD = _creds["password"]
+os_client = OpenSearch(
+    hosts=[{'host': OPENSEARCH_HOST, 'port': 443}],
+    # http_auth=awsauth,
+    http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD),
+    use_ssl=True,
+    verify_certs=True,
+    connection_class=RequestsHttpConnection,
+    timeout=30
+)
+
+
+
+def get_base_offset_from_filename(media_filename):
+    """
+    Extract time offset from filename.
+    Supports both old and new formats:
+    - New: segment-00234-39m00s.mp3 -> 2340 seconds
+    - Old: segment-00001.mp3 -> 10 seconds (based on SEGMENT_TIME_SECONDS)
+    """
+    match_time = re.search(r'-(\d+)m(\d+)s', media_filename)
+    if match_time:
+        try:
+            minutes = int(match_time.group(1))
+            seconds = int(match_time.group(2))
+            return (minutes * 60) + seconds
+        except ValueError:
+            pass
+
+    match_seq = re.search(r'segment-(\d+)', media_filename)
+    if match_seq:
+        try:
+            return int(match_seq.group(1)) * SEGMENT_TIME_SECONDS
+        except ValueError:
+            return 0
+    return 0
+
+
+def get_leading_silence_for_chunk(bucket, key):
+    """Seconds of silence the silence-removal step trimmed from the FRONT of
+    this chunk, read from the cleaned object's S3 metadata.
+
+    WHY THIS EXISTS: Transcribe runs on the SILENCE-REMOVED audio, so it always
+    reports speech starting at ~0.0s. Adding that to the chunk's base offset put
+    every message exactly on the 10-second boundary (00:25, 00:35 ...), which is
+    why every driver appeared to speak at the same instant. Adding back the
+    trimmed leading silence restores the real moment the driver spoke.
+
+    Returns 0.0 if the metadata is absent (e.g. chunk processed before this
+    change), which reproduces the old behaviour rather than failing.
+    """
+    try:
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+        raw = (head.get("Metadata") or {}).get("leading-silence")
+        if raw is None:
+            return 0.0
+        return max(0.0, float(raw))
+    except Exception as e:
+        print(f"[SPEECH_TIME] Could not read leading-silence for {key}: {e}")
+        return 0.0
+
+
+def format_timestamp(seconds_str, base_offset_seconds=0):
+    """Format seconds into MM:SS timestamp"""
+    try:
+        local_seconds = float(seconds_str)
+        global_seconds = base_offset_seconds + local_seconds
+        minutes = int(global_seconds // 60)
+        secs = int(global_seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+    except:
+        return "00:00"
+
+
+def format_race_relative_time(stored_session_time, prerace_buffer=0):
+    """Convert stored MM:SS / HH:MM:SS (seconds since ECS start) to race-relative
+    [-]MM:SS or [-]HH:MM:SS. Conversations before the actual race start are
+    prefixed with '-' (e.g. '-00:30'); at/after race start they are positive
+    (e.g. '00:00', '01:15'). Returns '00:00' for missing input."""
+    if not stored_session_time:
+        return "00:00"
+    try:
+        parts = list(map(int, str(stored_session_time).split(":")))
+    except (ValueError, AttributeError):
+        return str(stored_session_time)
+    if len(parts) == 2:
+        raw_seconds = parts[0] * 60 + parts[1]
+    elif len(parts) == 3:
+        raw_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    else:
+        return str(stored_session_time)
+    delta = raw_seconds - prerace_buffer
+    sign = "-" if delta < 0 else ""
+    abs_delta = abs(delta)
+    hours = abs_delta // 3600
+    minutes = (abs_delta % 3600) // 60
+    seconds = abs_delta % 60
+    if hours > 0:
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{sign}{minutes:02d}:{seconds:02d}"
+
+
+def session_time_to_seconds(stored_session_time):
+    """Parse a stored SessionTime ('MM:SS' or 'HH:MM:SS', possibly signed like
+    '-01:30') into total seconds. Sign-safe: a leading '-' negates the whole
+    value, unlike int('-00') which silently drops the sign and is what made the
+    race conversation order by magnitude (13, -17, 23, -27, ...) instead of by
+    signed race time."""
+    if not stored_session_time:
+        return 0
+    s = str(stored_session_time).strip()
+    negative = s.startswith('-')
+    if negative:
+        s = s[1:]
+    try:
+        parts = [int(p) for p in s.split(':')]
+    except (ValueError, AttributeError):
+        return 0
+    if len(parts) == 2:
+        total = parts[0] * 60 + parts[1]
+    elif len(parts) == 3:
+        total = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    else:
+        return 0
+    return -total if negative else total
+
+
+def get_text_hash(text, session_time):
+    """
+    Generate MD5 hash of text + session time for deduplication.
+    Allows same phrase at different times but catches true duplicates.
+    """
+    normalized = text.lower().strip()
+    normalized = ' '.join(normalized.split())
+    content = f"{normalized}|{session_time}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+
+def get_driver_metadata(session_id, driver_folder):
+    """Get driver metadata from S3 (uploaded by ECS ingester)"""
+    try:
+        metadata_key = f"{RAW_CHUNKS_PREFIX}{session_id}/{driver_folder}/metadata.json"
+        print(f"Looking for metadata at: {metadata_key}")
+        response = s3_client.get_object(
+            Bucket=S3_BUCKET,
+            Key=metadata_key
+        )
+        metadata = json.loads(response["Body"].read().decode("utf-8"))
+        print(f"Got metadata for {driver_folder}: {metadata}")
+        return metadata
+    except Exception as e:
+        print(f"Could not get driver metadata: {e}")
+        return None
+
+
+
+WORD_COUNT_THRESHOLD = int(os.environ.get("WORD_COUNT_THRESHOLD", 8))
+
+VOICE_SIMILARITY_THRESHOLD = float(os.environ.get("VOICE_SIMILARITY_THRESHOLD", 0.75))
+
+
+def get_speaker_profile(session_id, driver_folder):
+    """
+    Get speaker profile for a session/driver combination.
+    Returns profile with learned speaker patterns or None if not exists.
+
+    Profile structure:
+    {
+        "session_driver_id": "2025-01-05_12-00#Colton_Herta",
+        "engineer_avg_words": 15.5,
+        "driver_avg_words": 3.2,
+        "first_speaker_role": "Engineer",  # Who typically speaks first
+        "chunks_analyzed": 5,
+        "updated_at": 1704412800
+    }
+    """
+    try:
+        profile_key = f"{session_id}#{driver_folder}"
+        response = speaker_profiles_table.get_item(
+            Key={"session_driver_id": profile_key}
+        )
+        profile = response.get('Item')
+        if profile:
+            print(f"[SPEAKER] Found profile for {profile_key}: Eng avg={profile.get('engineer_avg_words')}, Driver avg={profile.get('driver_avg_words')}")
+        return profile
+    except Exception as e:
+        print(f"[SPEAKER] Error getting speaker profile: {e}")
+        return None
+
+
+def save_speaker_profile(session_id, driver_folder, engineer_avg_words, driver_avg_words, first_speaker_role, chunks_analyzed):
+    """
+    Save or update speaker profile for a session/driver combination.
+    """
+    try:
+        profile_key = f"{session_id}#{driver_folder}"
+        item = {
+            "session_driver_id": profile_key,
+            "session_id": session_id,
+            "driver_folder": driver_folder,
+            "engineer_avg_words": str(round(engineer_avg_words, 2)),
+            "driver_avg_words": str(round(driver_avg_words, 2)),
+            "first_speaker_role": first_speaker_role,
+            "chunks_analyzed": chunks_analyzed,
+            "updated_at": int(time.time())
+        }
+        speaker_profiles_table.put_item(Item=item)
+        print(f"[SPEAKER] Saved profile for {profile_key}")
+        return True
+    except Exception as e:
+        print(f"[SPEAKER] Error saving speaker profile: {e}")
+        return False
+
+
+def identify_role_by_word_count(text, profile=None):
+    """
+    Identify speaker role based on word count.
+
+    Heuristic:
+    - Engineers give longer instructions (typically 8+ words)
+    - Drivers give short responses (typically < 8 words)
+
+    If profile exists, use learned averages for better accuracy.
+    """
+    word_count = len(text.split())
+
+    if profile:
+        eng_avg = float(profile.get('engineer_avg_words', 15))
+        drv_avg = float(profile.get('driver_avg_words', 3))
+        threshold = (eng_avg + drv_avg) / 2
+
+        if word_count >= threshold:
+            return "Engineer"
+        else:
+            return "Driver"
+    else:
+        if word_count >= WORD_COUNT_THRESHOLD:
+            return "Engineer"
+        else:
+            return "Driver"
+
+
+
+def extract_voice_fingerprint(audio_data, sample_rate=22050):
+    """
+    Extract voice fingerprint features from audio data.
+
+    Uses librosa to extract:
+    - MFCC (Mel-frequency cepstral coefficients) - captures voice timbre
+    - Pitch/F0 (fundamental frequency) - captures voice pitch
+    - Spectral centroid - captures brightness of voice
+
+    Args:
+        audio_data: numpy array of audio samples
+        sample_rate: sample rate of audio (default 22050 Hz)
+
+    Returns:
+        dict with voice fingerprint features, or None if extraction fails
+    """
+    if not VOICE_FINGERPRINTING_ENABLED:
+        return None
+
+    try:
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
+        audio_data = audio_data.astype(np.float32)
+
+        if len(audio_data) < sample_rate * 0.5:
+            print("[VOICE] Audio too short for fingerprinting")
+            return None
+
+        mfccs = librosa.feature.mfcc(y=audio_data, sr=sample_rate, n_mfcc=13)
+        mfcc_mean = np.mean(mfccs, axis=1).tolist()
+        mfcc_std = np.std(mfccs, axis=1).tolist()
+
+        pitches, magnitudes = librosa.piptrack(y=audio_data, sr=sample_rate)
+        pitch_values = []
+        for t in range(pitches.shape[1]):
+            index = magnitudes[:, t].argmax()
+            pitch = pitches[index, t]
+            if pitch > 0:
+                pitch_values.append(pitch)
+
+        if pitch_values:
+            mean_pitch = float(np.mean(pitch_values))
+            std_pitch = float(np.std(pitch_values))
+        else:
+            mean_pitch = 0.0
+            std_pitch = 0.0
+
+        spectral_centroid = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate)
+        mean_centroid = float(np.mean(spectral_centroid))
+
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio_data, sr=sample_rate)
+        mean_rolloff = float(np.mean(spectral_rolloff))
+
+        fingerprint = {
+            "mfcc_mean": mfcc_mean,
+            "mfcc_std": mfcc_std,
+            "mean_pitch": mean_pitch,
+            "std_pitch": std_pitch,
+            "spectral_centroid": mean_centroid,
+            "spectral_rolloff": mean_rolloff
+        }
+
+        print(f"[VOICE] Extracted fingerprint: pitch={mean_pitch:.1f}Hz, centroid={mean_centroid:.1f}")
+        return fingerprint
+
+    except Exception as e:
+        print(f"[VOICE] Error extracting fingerprint: {e}")
+        return None
+
+
+def calculate_voice_similarity(fingerprint1, fingerprint2):
+    """
+    Calculate similarity between two voice fingerprints.
+
+    Uses weighted combination of:
+    - MFCC cosine similarity (most important - voice timbre)
+    - Pitch similarity
+    - Spectral similarity
+
+    Returns:
+        float between 0 and 1 (1 = identical voices)
+    """
+    if not VOICE_FINGERPRINTING_ENABLED:
+        return 0.0
+
+    if not fingerprint1 or not fingerprint2:
+        return 0.0
+
+    try:
+        mfcc1 = np.array(fingerprint1.get("mfcc_mean", []))
+        mfcc2 = np.array(fingerprint2.get("mfcc_mean", []))
+
+        if len(mfcc1) == len(mfcc2) and len(mfcc1) > 0:
+            dot_product = np.dot(mfcc1, mfcc2)
+            norm1 = np.linalg.norm(mfcc1)
+            norm2 = np.linalg.norm(mfcc2)
+            mfcc_similarity = dot_product / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0
+            mfcc_similarity = (mfcc_similarity + 1) / 2
+        else:
+            mfcc_similarity = 0.0
+
+        pitch1 = fingerprint1.get("mean_pitch", 0)
+        pitch2 = fingerprint2.get("mean_pitch", 0)
+        if pitch1 > 0 and pitch2 > 0:
+            pitch_diff = abs(pitch1 - pitch2) / max(pitch1, pitch2)
+            pitch_similarity = max(0, 1 - pitch_diff)
+        else:
+            pitch_similarity = 0.5
+
+        centroid1 = fingerprint1.get("spectral_centroid", 0)
+        centroid2 = fingerprint2.get("spectral_centroid", 0)
+        if centroid1 > 0 and centroid2 > 0:
+            centroid_diff = abs(centroid1 - centroid2) / max(centroid1, centroid2)
+            centroid_similarity = max(0, 1 - centroid_diff)
+        else:
+            centroid_similarity = 0.5
+
+        total_similarity = (
+            0.60 * mfcc_similarity +
+            0.25 * pitch_similarity +
+            0.15 * centroid_similarity
+        )
+
+        print(f"[VOICE] Similarity: MFCC={mfcc_similarity:.3f}, Pitch={pitch_similarity:.3f}, Centroid={centroid_similarity:.3f}, Total={total_similarity:.3f}")
+        return total_similarity
+
+    except Exception as e:
+        print(f"[VOICE] Error calculating similarity: {e}")
+        return 0.0
+
+
+def download_and_extract_audio_segment(s3_bucket, s3_key, start_time, end_time):
+    """
+    Download audio from S3 and extract a specific time segment.
+
+    Args:
+        s3_bucket: S3 bucket name
+        s3_key: S3 object key
+        start_time: Start time in seconds
+        end_time: End time in seconds
+
+    Returns:
+        tuple of (audio_data, sample_rate) or (None, None) if failed
+    """
+    if not VOICE_FINGERPRINTING_ENABLED:
+        return None, None
+
+    try:
+        response = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        audio_bytes = response['Body'].read()
+
+        audio_data, sample_rate = librosa.load(
+            io.BytesIO(audio_bytes),
+            sr=22050,
+            mono=True
+        )
+
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+
+        start_sample = max(0, start_sample)
+        end_sample = min(len(audio_data), end_sample)
+
+        if end_sample > start_sample:
+            segment_audio = audio_data[start_sample:end_sample]
+            return segment_audio, sample_rate
+        else:
+            return audio_data, sample_rate
+
+    except Exception as e:
+        print(f"[VOICE] Error downloading/extracting audio: {e}")
+        return None, None
+
+
+def get_voice_fingerprints_for_chunk(s3_bucket, audio_key, segments):
+    """
+    Extract voice fingerprints for each speaker in an audio chunk.
+
+    Args:
+        s3_bucket: S3 bucket name
+        audio_key: S3 key for the audio file
+        segments: List of speaker segments with start_time and end_time
+
+    Returns:
+        dict mapping speaker labels to their fingerprints: {"spk_0": {...}, "spk_1": {...}}
+    """
+    if not VOICE_FINGERPRINTING_ENABLED:
+        return {}
+
+    speaker_fingerprints = {}
+
+    try:
+        response = s3_client.get_object(Bucket=s3_bucket, Key=audio_key)
+        audio_bytes = response['Body'].read()
+
+        full_audio, sample_rate = librosa.load(
+            io.BytesIO(audio_bytes),
+            sr=22050,
+            mono=True
+        )
+
+        print(f"[VOICE] Loaded audio: {len(full_audio)/sample_rate:.2f}s at {sample_rate}Hz")
+
+        speaker_audio = {}
+
+        for seg in segments:
+            speaker = seg.get("speaker_label", "unknown")
+            start_time = float(seg.get("start_time", 0))
+            end_time = float(seg.get("end_time", 0))
+
+            start_sample = int(start_time * sample_rate)
+            end_sample = int(end_time * sample_rate)
+
+            if end_sample > start_sample and end_sample <= len(full_audio):
+                segment_audio = full_audio[start_sample:end_sample]
+
+                if speaker not in speaker_audio:
+                    speaker_audio[speaker] = []
+                speaker_audio[speaker].append(segment_audio)
+
+        for speaker, audio_segments in speaker_audio.items():
+            if audio_segments:
+                combined_audio = np.concatenate(audio_segments)
+
+                fingerprint = extract_voice_fingerprint(combined_audio, sample_rate)
+                if fingerprint:
+                    speaker_fingerprints[speaker] = fingerprint
+                    print(f"[VOICE] Extracted fingerprint for {speaker}")
+
+        return speaker_fingerprints
+
+    except Exception as e:
+        print(f"[VOICE] Error getting fingerprints for chunk: {e}")
+        return {}
+
+
+def save_voice_fingerprints_to_profile(session_id, driver_folder, speaker_fingerprints, speaker_roles):
+    """
+    Save voice fingerprints to the speaker profile in DynamoDB.
+
+    Args:
+        session_id: Session identifier
+        driver_folder: Driver folder name
+        speaker_fingerprints: Dict of {speaker_label: fingerprint}
+        speaker_roles: Dict of {speaker_label: role} e.g., {"spk_0": "Engineer", "spk_1": "Driver"}
+    """
+    try:
+        profile_key = f"{session_id}#{driver_folder}"
+
+        response = speaker_profiles_table.get_item(Key={"session_driver_id": profile_key})
+        profile = response.get('Item', {})
+
+        voice_fingerprints = {}
+        for speaker, fingerprint in speaker_fingerprints.items():
+            role = speaker_roles.get(speaker, "Unknown")
+            if role in ["Engineer", "Driver"]:
+                voice_fingerprints[role] = fingerprint
+
+        update_expression = "SET voice_fingerprints = :vf, has_voice_fingerprint = :hvf, updated_at = :ua"
+        expression_values = {
+            ":vf": json.dumps(voice_fingerprints),
+            ":hvf": True,
+            ":ua": int(time.time())
+        }
+
+        speaker_profiles_table.update_item(
+            Key={"session_driver_id": profile_key},
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values
+        )
+
+        print(f"[VOICE] Saved voice fingerprints for {profile_key}: {list(voice_fingerprints.keys())}")
+        return True
+
+    except Exception as e:
+        print(f"[VOICE] Error saving voice fingerprints: {e}")
+        return False
+
+
+def match_speaker_to_stored_fingerprints(fingerprint, profile):
+    """
+    Match a voice fingerprint against stored fingerprints in profile.
+
+    Args:
+        fingerprint: The voice fingerprint to match
+        profile: Speaker profile containing stored fingerprints
+
+    Returns:
+        tuple of (matched_role, similarity_score) or (None, 0) if no match
+    """
+    if not profile or not fingerprint:
+        return None, 0.0
+
+    try:
+        stored_fingerprints_json = profile.get('voice_fingerprints')
+        if not stored_fingerprints_json:
+            return None, 0.0
+
+        stored_fingerprints = json.loads(stored_fingerprints_json)
+
+        best_match_role = None
+        best_similarity = 0.0
+
+        for role, stored_fp in stored_fingerprints.items():
+            similarity = calculate_voice_similarity(fingerprint, stored_fp)
+            print(f"[VOICE] Matching against {role}: similarity={similarity:.3f}")
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match_role = role
+
+        if best_similarity >= VOICE_SIMILARITY_THRESHOLD:
+            print(f"[VOICE] Best match: {best_match_role} with similarity {best_similarity:.3f}")
+            return best_match_role, best_similarity
+        else:
+            print(f"[VOICE] No match above threshold {VOICE_SIMILARITY_THRESHOLD}")
+            return None, best_similarity
+
+    except Exception as e:
+        print(f"[VOICE] Error matching fingerprint: {e}")
+        return None, 0.0
+
+
+def process_segments_with_speaker_identification(segments, word_map, confidence_map, session_id, driver_folder, audio_s3_bucket=None, audio_s3_key=None):
+    """
+    Process segments and assign consistent Engineer/Driver labels.
+
+    Enhanced Logic with Voice Fingerprinting:
+    1. If profile has voice fingerprints: Match current speakers to stored fingerprints
+    2. If 2 speakers detected (no fingerprints): Learn pattern using word count + extract voice fingerprints
+    3. If 1 speaker: Use voice matching first, fallback to word count heuristic
+    4. Update profile with voice fingerprints for future chunks
+
+    Args:
+        segments: Speaker segments from AWS Transcribe
+        word_map: Dict mapping start_time to word
+        confidence_map: Dict mapping start_time to confidence
+        session_id: Session identifier
+        driver_folder: Driver folder name
+        audio_s3_bucket: S3 bucket containing audio file (for voice fingerprinting)
+        audio_s3_key: S3 key for audio file (for voice fingerprinting)
+
+    Returns:
+        processed_segments: List of segments with role labels
+    """
+    processed_segments = []
+
+    if not segments:
+        return processed_segments
+
+    profile = get_speaker_profile(session_id, driver_folder)
+    has_voice_fingerprints = profile.get('has_voice_fingerprint', False) if profile else False
+
+    print(f"[SPEAKER] Profile exists: {profile is not None}, Has voice fingerprints: {has_voice_fingerprints}")
+
+    speaker_data = {}
+
+    for seg in segments:
+        speaker = seg["speaker_label"]
+
+        seg_words = []
+        seg_conf_total = 0.0
+        seg_conf_count = 0
+
+        for ref in seg.get("items", []):
+            start = ref.get("start_time")
+            if start in word_map:
+                seg_words.append(word_map[start])
+                if start in confidence_map:
+                    seg_conf_total += confidence_map[start]
+                    seg_conf_count += 1
+
+        if seg_words:
+            text = " ".join(seg_words)
+            word_count = len(seg_words)
+
+            if speaker not in speaker_data:
+                speaker_data[speaker] = {"texts": [], "word_counts": [], "segments": []}
+
+            speaker_data[speaker]["texts"].append(text)
+            speaker_data[speaker]["word_counts"].append(word_count)
+            speaker_data[speaker]["segments"].append({
+                "text": text,
+                "confidence": round((seg_conf_total / seg_conf_count) if seg_conf_count else 0.0, 4),
+                "original_speaker": speaker
+            })
+
+    unique_speakers = list(speaker_data.keys())
+    num_speakers = len(unique_speakers)
+
+    print(f"[SPEAKER] Chunk has {num_speakers} unique speaker(s): {unique_speakers}")
+
+    role_mapping = {}
+
+    voice_matched = False
+
+    if has_voice_fingerprints and VOICE_FINGERPRINTING_ENABLED and audio_s3_bucket and audio_s3_key:
+        print("[SPEAKER] Attempting voice fingerprint matching...")
+
+        current_fingerprints = get_voice_fingerprints_for_chunk(audio_s3_bucket, audio_s3_key, segments)
+
+        if current_fingerprints:
+            for speaker, fingerprint in current_fingerprints.items():
+                matched_role, similarity = match_speaker_to_stored_fingerprints(fingerprint, profile)
+                if matched_role:
+                    role_mapping[speaker] = matched_role
+                    print(f"[SPEAKER] Voice matched {speaker} -> {matched_role} (similarity: {similarity:.3f})")
+                    voice_matched = True
+
+            if num_speakers == 2 and len(role_mapping) == 2:
+                assigned_roles = set(role_mapping.values())
+                if assigned_roles == {"Engineer", "Driver"}:
+                    print("[SPEAKER] Voice matching successful for both speakers")
+                else:
+                    print("[SPEAKER] Voice matching inconsistent, falling back to word count")
+                    role_mapping = {}
+                    voice_matched = False
+
+    if not voice_matched:
+        if num_speakers == 2:
+            print("[SPEAKER] Using word count heuristic for 2-speaker identification")
+
+            spk_0_avg = sum(speaker_data.get("spk_0", {}).get("word_counts", [0])) / max(len(speaker_data.get("spk_0", {}).get("word_counts", [])), 1)
+            spk_1_avg = sum(speaker_data.get("spk_1", {}).get("word_counts", [0])) / max(len(speaker_data.get("spk_1", {}).get("word_counts", [])), 1)
+
+            print(f"[SPEAKER] 2-speaker chunk: spk_0 avg words={spk_0_avg:.1f}, spk_1 avg words={spk_1_avg:.1f}")
+
+            if spk_0_avg >= spk_1_avg:
+                role_mapping["spk_0"] = "Engineer"
+                role_mapping["spk_1"] = "Driver"
+                first_speaker_role = "Engineer"
+                engineer_avg = spk_0_avg
+                driver_avg = spk_1_avg
+            else:
+                role_mapping["spk_0"] = "Driver"
+                role_mapping["spk_1"] = "Engineer"
+                first_speaker_role = "Driver"
+                engineer_avg = spk_1_avg
+                driver_avg = spk_0_avg
+
+            chunks_analyzed = int(profile.get('chunks_analyzed', 0)) + 1 if profile else 1
+
+            if profile:
+                old_eng_avg = float(profile.get('engineer_avg_words', engineer_avg))
+                old_drv_avg = float(profile.get('driver_avg_words', driver_avg))
+                old_chunks = int(profile.get('chunks_analyzed', 0))
+
+                engineer_avg = ((old_eng_avg * old_chunks) + engineer_avg) / (old_chunks + 1)
+                driver_avg = ((old_drv_avg * old_chunks) + driver_avg) / (old_chunks + 1)
+
+            save_speaker_profile(session_id, driver_folder, engineer_avg, driver_avg, first_speaker_role, chunks_analyzed)
+
+            if VOICE_FINGERPRINTING_ENABLED and audio_s3_bucket and audio_s3_key and not has_voice_fingerprints:
+                print("[SPEAKER] Extracting voice fingerprints for future matching...")
+
+                current_fingerprints = get_voice_fingerprints_for_chunk(audio_s3_bucket, audio_s3_key, segments)
+
+                if current_fingerprints and len(current_fingerprints) == 2:
+                    save_voice_fingerprints_to_profile(session_id, driver_folder, current_fingerprints, role_mapping)
+                    print("[SPEAKER] Voice fingerprints saved for future chunks")
+
+        elif num_speakers == 1:
+            speaker = unique_speakers[0]
+
+            role_assigned = False
+
+            if has_voice_fingerprints and VOICE_FINGERPRINTING_ENABLED and audio_s3_bucket and audio_s3_key:
+                print("[SPEAKER] Attempting voice match for single speaker...")
+
+                current_fingerprints = get_voice_fingerprints_for_chunk(audio_s3_bucket, audio_s3_key, segments)
+
+                if current_fingerprints and speaker in current_fingerprints:
+                    matched_role, similarity = match_speaker_to_stored_fingerprints(current_fingerprints[speaker], profile)
+                    if matched_role:
+                        role_mapping[speaker] = matched_role
+                        role_assigned = True
+                        print(f"[SPEAKER] Single speaker voice matched: {matched_role} (similarity: {similarity:.3f})")
+
+            if not role_assigned:
+                all_texts = " ".join(speaker_data[speaker]["texts"])
+                role = identify_role_by_word_count(all_texts, profile)
+                role_mapping[speaker] = role
+                print(f"[SPEAKER] Single speaker assigned as {role} based on word count")
+
+    for speaker, data in speaker_data.items():
+        role = role_mapping.get(speaker, "Unknown")
+        for seg_info in data["segments"]:
+            processed_segments.append({
+                "role": role,
+                "text": seg_info["text"],
+                "confidence": seg_info["confidence"]
+            })
+
+    return processed_segments
+
+
+
+def remove_stale_connection(connection_id):
+    """Remove a stale WebSocket connection from DynamoDB"""
+    try:
+        ws_connections_table.delete_item(Key={'connectionId': connection_id})
+        print(f"Removed stale connection: {connection_id}")
+    except Exception as e:
+        print(f"Error removing stale connection: {e}")
+
+
+def get_all_websocket_connection_items():
+    """Get all active WebSocket connection rows (full items, including the
+    domainName/stage metadata the WebSocket Lambda saves on $connect)."""
+    try:
+        response = ws_connections_table.scan()
+        items = response.get('Items', [])
+        print(f"Found {len(items)} active WebSocket connections")
+        return items
+    except Exception as e:
+        print(f"Error getting WebSocket connections: {e}")
+        return []
+
+
+def resolve_websocket_endpoint(connection_items):
+    """Resolve the API Gateway management endpoint used to push to clients.
+
+    Prefer the WEBSOCKET_ENDPOINT env var. If it is not set, derive it from
+    the domainName/stage stored on a live connection (the WebSocket Lambda
+    saves these on $connect). Returns None only if neither is available.
+
+    Without this fallback, an unset WEBSOCKET_ENDPOINT silently dropped every
+    live transcription push, so the dashboard only ever updated on a manual
+    page refresh (which re-runs the $connect search)."""
+    if WEBSOCKET_ENDPOINT:
+        return WEBSOCKET_ENDPOINT
+    sample = next(
+        (c for c in connection_items if c.get('domainName') and c.get('stage')),
+        None
+    )
+    if sample:
+        endpoint = f"https://{sample['domainName']}/{sample['stage']}"
+        print(f"[WEBSOCKET] Derived endpoint from connection metadata: {endpoint}")
+        return endpoint
+    print("[WEBSOCKET] WEBSOCKET_ENDPOINT not set and no domain/stage metadata "
+          "found on connections - cannot push")
+    return None
+
+
+def push_to_websocket_clients(doc, session_id, driver_folder, original_filename, prerace_buffer=0):
+    """Push new transcription data to all connected WebSocket clients.
+
+    prerace_buffer is RaceStartAt - StartedAt (seconds). It is subtracted from
+    the stored chunk-relative SessionTime so that conversations before the
+    actual race start appear as negative timestamps (e.g. '-00:30') and
+    conversations at or after race start appear as positive (e.g. '00:00').
+    """
+
+    connection_items = get_all_websocket_connection_items()
+
+    if not connection_items:
+        print("No active WebSocket connections - skipping push")
+        return
+
+    endpoint = resolve_websocket_endpoint(connection_items)
+    if not endpoint:
+        print("Could not resolve WebSocket endpoint - skipping push")
+        return
+
+    try:
+        apigw_client = boto3.client(
+            'apigatewaymanagementapi',
+            endpoint_url=endpoint
+        )
+    except Exception as e:
+        print(f"Error creating API Gateway client: {e}")
+        return
+
+    mp3_key = f"{SILENCE_REMOVED_PREFIX}{session_id}/{driver_folder}/{original_filename}"
+
+    try:
+        audio_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": mp3_key},
+            ExpiresIn=3600
+        )
+    except Exception as e:
+        print(f"Error generating presigned URL: {e}")
+        audio_url = None
+
+
+    segments_data = doc.get("Segments", [])
+    if not segments_data:
+        segments_data = [{"role": "Unknown", "text": doc.get("Message", "")}]
+
+    payload = {
+        "message_type": "new_transcription",
+        # Tells the UI which session this message belongs to. Without it the UI
+        # cannot filter, so a live session can leak messages onto a different
+        # session's screen.
+        "session_id": session_id,
+        # Stable unique id per chunk, so the UI's de-duplication never discards
+        # two different messages as if they were the same row.
+        "_id": f"{session_id}_{driver_folder}_{original_filename}",
+        "team": doc.get("Team") or "TEST",
+        "driver": doc.get("Driver"),
+        "driver_id": driver_folder,
+        "speaker": doc.get("Speaker"),
+        "time": format_race_relative_time(doc.get("SessionTime"), prerace_buffer),
+        # Signed seconds relative to race start (negative = before race start),
+        # matching the search path's `time_seconds`. The frontend must order the
+        # conversation by THIS numeric value, not by parsing the `time` string.
+        "time_seconds": session_time_to_seconds(doc.get("SessionTime")) - prerace_buffer,
+        "message": segments_data,
+        "audio_url": audio_url,
+        "source_file": original_filename,
+        "timestamp": doc.get("Timestamp"),
+        "expires_in_seconds": LIVE_CONVERSATION_WINDOW_SECONDS
+    }
+
+    print(f"Pushing to {len(connection_items)} WebSocket clients")
+
+    for conn in connection_items:
+        connection_id = conn.get('connectionId')
+        if not connection_id:
+            continue
+        try:
+            apigw_client.post_to_connection(
+                ConnectionId=connection_id,
+                Data=json.dumps(payload).encode('utf-8')
+            )
+            print(f"Successfully pushed to connection: {connection_id}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ['GoneException', 'ForbiddenException', 'BadRequestException']:
+                print(f"Connection {connection_id} is stale, removing...")
+                remove_stale_connection(connection_id)
+            else:
+                print(f"Error pushing to {connection_id}: {e}")
+        except Exception as e:
+            print(f"Unexpected error pushing to {connection_id}: {e}")
+
+
+
+def lambda_handler(event, context):
+    """Process S3 events for new transcription JSON files"""
+
+    if "Records" not in event:
+        raise ValueError("This Lambda must be triggered by S3 events.")
+
+    results = []
+
+    for record in event['Records']:
+        try:
+            output_bucket = record['s3']['bucket']['name']
+            output_key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+
+            print(f"S3 trigger received for file: s3://{output_bucket}/{output_key}")
+
+            if not output_key.startswith(INPUT_PREFIX) or not output_key.endswith(".json"):
+                print(f"Skipping non-transcript file: {output_key}")
+                results.append({
+                    "file": output_key,
+                    "status": "ignored",
+                    "reason": "Non-transcript file"
+                })
+                continue
+
+            key_parts = output_key.replace(INPUT_PREFIX, "").split("/")
+            session_id = key_parts[0] if len(key_parts) >= 1 else "unknown"
+            driver_folder = key_parts[1] if len(key_parts) >= 2 else None
+
+            if not driver_folder:
+                print(f"Skipping file with no driver folder: {output_key}")
+                results.append({
+                    "file": output_key,
+                    "status": "ignored",
+                    "reason": "No driver folder found"
+                })
+                continue
+
+            print(f"Session ID: {session_id}, Driver folder: {driver_folder}")
+
+            record_audit_event('INDEXING_START', 'pipeline', session_id, 'system', {
+                'driver_folder': driver_folder,
+                'file': output_key
+            })
+
+            data = None
+            for _ in range(3):
+                try:
+                    obj = s3_client.get_object(Bucket=output_bucket, Key=output_key)
+                    data = json.loads(obj["Body"].read().decode("utf-8"))
+                    print("Successfully read S3 JSON file")
+                    break
+                except s3_client.exceptions.NoSuchKey:
+                    print("Retrying S3 read...")
+                    time.sleep(1)
+
+            if data is None:
+                raise Exception(f"Failed to read S3 file {output_key} after retries")
+
+            if data.get("status") != "COMPLETED":
+                print("Skipping incomplete job")
+                results.append({
+                    "file": output_key,
+                    "status": "skipped",
+                    "reason": "Incomplete transcription job"
+                })
+                continue
+
+            job_name = data.get("jobName")
+            media_uri = data.get("Media", {}).get("MediaFileUri")
+
+            if media_uri:
+                original_filename = os.path.basename(urllib.parse.urlparse(media_uri).path)
+            else:
+
+                match_new = re.search(r'(segment-\d+-\d+m\d+s(?:_recorded)?)', job_name) if job_name else None
+                if match_new:
+                    original_filename = f"{match_new.group(1)}.mp3"
+                else:
+                    match_old = re.search(r'(segment-\d+(?:_recorded)?)', job_name) if job_name else None
+                    if match_old:
+                        original_filename = f"{match_old.group(1)}.mp3"
+                    else:
+                        original_filename = "unknown.mp3"
+
+            print(f"Transcription job: {job_name}, Filename: {original_filename}")
+
+
+            transcription_results = data.get('results')
+            if not transcription_results:
+                print(f"No results found in transcription data for {job_name}")
+                results.append({
+                    "file": output_key,
+                    "status": "skipped",
+                    "reason": "No results in transcription"
+                })
+                continue
+
+            items = transcription_results.get('items') or []
+
+            # CRASH FIX: for a chunk with NO SPEECH (music, silence, crowd noise)
+            # Transcribe returns "speaker_labels": null - the key EXISTS with a
+            # null value, so .get('speaker_labels', {}) returned None, not {}, and
+            # the following .get('segments') raised
+            #     AttributeError: 'NoneType' object has no attribute 'get'
+            # The per-file handler swallowed it, so the chunk silently never
+            # reached OpenSearch or DynamoDB and showed as a red MISSING on the
+            # pipeline board - indistinguishable from a real failure.
+            speaker_labels = transcription_results.get('speaker_labels') or {}
+            segments = speaker_labels.get('segments') or []
+
+            transcripts_list = transcription_results.get('transcripts') or []
+            full_transcript_text = (
+                transcripts_list[0].get('transcript', '') if transcripts_list else ''
+            )
+
+            # No speech in this chunk. Skip DELIBERATELY and say so. There is
+            # nothing to show in the race conversation for music or silence, so
+            # this is the right outcome - it just has to be a visible decision
+            # rather than a swallowed crash.
+            if not full_transcript_text.strip():
+                print(f"NO_SPEECH: {job_name} - no speech detected (music/silence), not indexed")
+                results.append({
+                    "file": output_key,
+                    "status": "no_speech",
+                    "reason": "No speech detected in audio"
+                })
+                continue
+
+            first_segment_start_local = "0.0"
+
+            word_map = {}
+            confidence_map = {}
+            total_conf = 0.0
+            word_count = 0
+
+            for item in items:
+                if item["type"] == "pronunciation" and "start_time" in item:
+                    alt = item["alternatives"][0]
+                    start = item["start_time"]
+                    word_map[start] = alt["content"]
+                    try:
+                        conf = float(alt["confidence"])
+                    except:
+                        conf = 0.0
+                    confidence_map[start] = conf
+                    total_conf += conf
+                    word_count += 1
+
+            overall_conf = round(total_conf / word_count, 4) if word_count > 0 else 0.0
+
+            audio_s3_key = f"{SILENCE_REMOVED_PREFIX}{session_id}/{driver_folder}/{original_filename}"
+
+            processed_segments = []
+            first_segment_start_local = "0.0"
+
+            if segments:
+                first_segment_start_local = segments[0].get("start_time", "0.0")
+
+                processed_segments = process_segments_with_speaker_identification(
+                    segments, word_map, confidence_map, session_id, driver_folder,
+                    audio_s3_bucket=S3_BUCKET, audio_s3_key=audio_s3_key
+                )
+
+            base_offset = get_base_offset_from_filename(original_filename)
+            # Add back the silence trimmed from the front of this chunk, so the
+            # timestamp reflects when the driver ACTUALLY spoke rather than the
+            # chunk boundary. Whole seconds only.
+            leading_silence = get_leading_silence_for_chunk(S3_BUCKET, audio_s3_key)
+            speech_offset = float(first_segment_start_local or 0) + leading_silence
+            session_time = format_timestamp(speech_offset, base_offset)
+            print(f"[SPEECH_TIME] chunk_base={base_offset}s "
+                  f"+ leading_silence={leading_silence:.3f}s "
+                  f"+ in_audio={float(first_segment_start_local or 0):.3f}s "
+                  f"=> {session_time}")
+            if not session_time:
+                session_time = "00:00"
+                print(f"[STORE] WARNING: session_time was empty/null, defaulting to 00:00 (file={original_filename})")
+
+            metadata = get_driver_metadata(session_id, driver_folder)
+            driver_display_name = metadata.get("driver_name", driver_folder) if metadata else driver_folder
+            team_name = metadata.get("team", "UNKNOWN") if metadata else "UNKNOWN"
+            print(f"Driver: {driver_display_name}, Team: {team_name}")
+
+            text_hash = get_text_hash(full_transcript_text, session_time)
+            print(f"Text hash: {text_hash}")
+
+            try:
+                audio_url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": S3_BUCKET, "Key": audio_s3_key},
+                    ExpiresIn= 86400
+                )
+                audio_s3_path = f"s3://{S3_BUCKET}/{audio_s3_key}"
+            except Exception as e:
+                print(f"Error generating presigned URL for audio: {e}")
+                audio_url = None
+                audio_s3_path = f"s3://{S3_BUCKET}/{audio_s3_key}"
+
+            doc = {
+                "SessionId": session_id,
+                "DriverId": driver_folder,
+                "Driver": driver_display_name,
+                "Speaker": "SPE",
+                "Team": team_name,
+                "SessionTime": session_time,
+                "Message": full_transcript_text,
+                "Segments": processed_segments,
+                "OverallConfidence": overall_conf,
+                "SourceJob": job_name,
+                "SourceFile": original_filename,
+                "SourceBucket": output_bucket,
+                "SourceKey": output_key,
+                "AudioUrl": audio_url,
+                "AudioS3Path": audio_s3_path,
+                "Timestamp": time.time()
+            }
+
+            print(f"=== DYNAMODB INSERT ===")
+            dynamodb_item = {
+                "SessionId": session_id,
+                "DriverId": driver_folder,
+                "SourceJobs": job_name,
+                "SourceFile": original_filename,
+                "Driver": driver_display_name,
+                "Speaker": "SPE",
+                "Team": team_name,
+                "SessionTime": session_time,
+                "Message": full_transcript_text,
+                "TextHash": text_hash,
+                "Segments": json.dumps(processed_segments),
+                "OverallConfidence": str(overall_conf),
+                "SourceBucket": output_bucket,
+                "SourceKey": output_key,
+                "AudioS3Path": audio_s3_path,
+                # SORT KEY - MUST BE UNIQUE PER MESSAGE.
+                # Was str(int(time.time())) i.e. WHOLE SECONDS. The table key is
+                # SessionId(HASH)+Timestamp(RANGE), so two messages written in the
+                # same second had an IDENTICAL key and put_item silently overwrote
+                # one with the other - ~34% of rows lost, no errors logged.
+                "Timestamp": f"{int(time.time() * 1000):013d}#{job_name}",
+                "WrittenAtEpoch": str(int(time.time()))
+            }
+
+            dynamodb_max_retries = 3
+            dynamodb_retry_delay = 1
+            dynamodb_success = False
+
+            for dynamodb_attempt in range(dynamodb_max_retries):
+                try:
+                    dynamodb_response = dynamodb_table.put_item(Item=dynamodb_item)
+                    print(f"DynamoDB write SUCCESS (attempt {dynamodb_attempt + 1}): {driver_folder}/{job_name}")
+                    dynamodb_success = True
+                    break
+                except ClientError as e:
+                    error_code = e.response.get('Error', {}).get('Code', '')
+                    print(f"DynamoDB write ERROR (attempt {dynamodb_attempt + 1}/{dynamodb_max_retries}): {error_code} - {e}")
+                    if error_code in ['ProvisionedThroughputExceededException', 'ThrottlingException']:
+                        if dynamodb_attempt < dynamodb_max_retries - 1:
+                            print(f"Retrying DynamoDB in {dynamodb_retry_delay} seconds...")
+                            time.sleep(dynamodb_retry_delay)
+                            dynamodb_retry_delay *= 2
+                    else:
+                        break
+
+            if not dynamodb_success:
+                print(f"FAILED_DYNAMODB_WRITE: session_id={session_id}, driver={driver_folder}, job={job_name}")
+            # print("=== DYNAMODB INSERT SKIPPED (commented out) ===")
+            dynamodb_success = True  # Set True so rest of code flows normally
+
+            doc_id = f"{session_id}_{driver_folder}_{job_name}"
+            print(f"Indexing into OpenSearch: index={OPENSEARCH_INDEX}, doc_id={doc_id}")
+
+            max_retries = 3
+            retry_delay = 1
+            opensearch_success = False
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = os_client.index(index=OPENSEARCH_INDEX, id=doc_id, body=doc)
+                    print(f"OpenSearch index SUCCESS (attempt {attempt + 1}): _id={response.get('_id')}, result={response.get('result')}")
+                    opensearch_success = True
+                    break
+                except Exception as os_error:
+                    last_error = os_error
+                    print(f"OpenSearch index ERROR (attempt {attempt + 1}/{max_retries}): {os_error}")
+                    if attempt < max_retries - 1:
+                        print(f"Retrying in {retry_delay} seconds...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        print(f"OpenSearch ERROR: All {max_retries} attempts failed for {doc_id}")
+                        print(f"OpenSearch ERROR details: index={OPENSEARCH_INDEX}, host={OPENSEARCH_HOST}")
+
+            if not opensearch_success:
+                print(f"FAILED_OPENSEARCH_INDEX: session_id={session_id}, driver={driver_folder}, doc_id={doc_id}, error={last_error}")
+                response = {"_id": doc_id, "result": "error", "error": str(last_error)}
+
+            is_live_session = False
+            is_uploaded_recording = False
+            prerace_buffer = 0
+
+            if '_recorded' in original_filename.lower() or '_recorded' in output_key.lower():
+                is_uploaded_recording = True
+                print(f"[WEBSOCKET] Detected uploaded recording from filename: {original_filename}")
+
+            if not is_uploaded_recording:
+                try:
+                    active_sessions_table = dynamodb_client.Table(ACTIVE_SESSIONS_TABLE)
+                    active_session = active_sessions_table.get_item(Key={'SessionId': session_id})
+                    active_item = active_session.get('Item') or {}
+                    if active_item.get('Status') == 'ACTIVE':
+                        is_live_session = True
+                        print(f"[WEBSOCKET] Session {session_id} is ACTIVE in v2_ActiveSessions")
+                        try:
+                            started_at = int(active_item.get('StartedAt', 0) or 0)
+                            race_start_ts = int(active_item.get('RaceStartAt', 0) or 0)
+                            if started_at and race_start_ts:
+                                prerace_buffer = race_start_ts - started_at
+                            print(f"[WEBSOCKET] started_at={started_at}, race_start_ts={race_start_ts}, prerace_buffer={prerace_buffer}")
+                        except (TypeError, ValueError) as time_err:
+                            print(f"[WEBSOCKET] Could not compute prerace_buffer ({time_err}); defaulting to 0")
+                    else:
+                        print(f"[WEBSOCKET] Session {session_id} not found or not ACTIVE in v2_ActiveSessions")
+                except Exception as check_error:
+                    print(f"[WEBSOCKET] Error checking active session: {check_error}")
+                    is_live_session = False
+
+            if is_live_session and not is_uploaded_recording:
+                print("=== WEBSOCKET PUSH (live session) ===")
+                push_to_websocket_clients(doc, session_id, driver_folder, original_filename, prerace_buffer)
+            else:
+                reason = "uploaded recording" if is_uploaded_recording else "not an active live session"
+                print(f"=== WEBSOCKET PUSH SKIPPED ({reason}) ===")
+
+            print(f"Successfully processed document for {driver_folder}")
+            log_result = {
+                "file": output_key,
+                "driver_folder": driver_folder,
+                "status": "processed",
+                "docId": response.get("_id"),
+                "index": OPENSEARCH_INDEX,
+                "dynamodb_table": DYNAMODB_TABLE_NAME
+            }
+            results.append(log_result)
+
+            record_audit_event('INDEXING_SUCCESS', 'pipeline', session_id, 'system', {
+                'driver_folder': driver_folder,
+                'doc_id': response.get("_id"),
+                'file': output_key
+            })
+
+            save_indexing_log(session_id, driver_folder, output_key, log_result)
+
+        except Exception as e:
+            print(f"ERROR processing file {record.get('s3', {}).get('object', {}).get('key', 'unknown')}: {e}")
+            error_result = {
+                "file": output_key,
+                "status": "error",
+                "error": str(e)
+            }
+            results.append(error_result)
+
+            record_audit_event('INDEXING_FAILED', 'pipeline', session_id, 'system', {
+                'driver_folder': driver_folder,
+                'file': output_key,
+                'error': str(e)
+            })
+
+            save_indexing_log(session_id, driver_folder, output_key, error_result)
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(results)
+    }
+
+
+def save_indexing_log(session_id, driver_folder, source_file, log_data):
+    """Save indexing log to S3"""
+    from datetime import datetime
+
+    log_data['processed_at'] = datetime.utcnow().isoformat()
+    base_name = os.path.basename(source_file).replace('.json', '')
+    log_key = f"{LOG_PREFIX}{session_id}/{driver_folder}/{base_name}_indexing.json"
+
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=log_key,
+            Body=json.dumps(log_data, indent=2),
+            ContentType="application/json"
+        )
+        print(f"Log saved: s3://{S3_BUCKET}/{log_key}")
+    except Exception as e:
+        print(f"Error saving log: {e}")

@@ -1,0 +1,2361 @@
+# ####### 22/07/2026 ######
+"""Configuration Management Lambda
+Handles all configuration APIs for the Andretti Transcription System
+
+NEW FEATURE - December 29, 2024 Client Requirements
+
+Endpoints:
+1. Session Configuration - /session-config (start/end times, session name)
+2. Driver/Fit Configuration - /driver-config (fit address, driver mapping)
+3. Team Configuration - /team-config (team name, color code, logo)
+4. Keywords Configuration - /keywords-config (keywords + colors for highlighting)
+5. Recorded File Upload - /upload-recording (support for pre-recorded files)
+6. List Recordings - /list-recordings (list all recording sessions)
+7. Get Transcriptions - /transcriptions (get transcriptions for a session)
+
+Author: People Tech Group
+Created: December 29, 2024
+"""
+
+import json
+import re
+import boto3
+import os
+import uuid
+import urllib.request
+import urllib.error
+import base64
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from boto3.dynamodb.conditions import Key
+
+
+def sanitize_for_path(name):
+    """
+    Sanitize a name for use in S3 paths.
+    Replaces spaces and special characters with underscores.
+    Example: "Colton Herta" -> "Colton_Herta"
+    """
+    return re.sub(r'[^0-9a-zA-Z._-]', '_', name)
+
+dynamodb = boto3.resource('dynamodb')
+s3_client = boto3.client('s3')
+
+SESSION_CONFIG_TABLE = os.environ.get('SESSION_CONFIG_TABLE', 'v2_SessionConfig')
+DRIVER_CONFIG_TABLE = os.environ.get('DRIVER_CONFIG_TABLE', 'v2_DriverConfig')
+TEAM_CONFIG_TABLE = os.environ.get('TEAM_CONFIG_TABLE', 'v2_TeamConfig')
+KEYWORDS_CONFIG_TABLE = os.environ.get('KEYWORDS_CONFIG_TABLE', 'v2_KeywordsConfig')
+
+RELEVANT_MESSAGES_TABLE = os.environ.get('RELEVANT_MESSAGES_TABLE', 'RelavantMessages')
+TEXTHASH_TABLE = os.environ.get('TEXTHASH_TABLE', 'v2_texthash-table')
+ACTIVE_SESSIONS_TABLE = os.environ.get('ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions')
+
+S3_BUCKET = os.environ.get('S3_BUCKET', 'test-v2-andretti-transcription-system')
+RAW_CHUNKS_PREFIX = os.environ.get('RAW_CHUNKS_PREFIX', 'raw-chunks/')
+UPLOADS_PREFIX = os.environ.get('UPLOADS_PREFIX', 'uploads/')
+
+# Audit trail + environment configuration.
+AUDIT_S3_BUCKET = os.environ.get('AUDIT_S3_BUCKET', 'test-v2-andretti-audit-logs')
+AUDIT_S3_PREFIX = os.environ.get('AUDIT_S3_PREFIX', 'audit-logs/')
+SESSION_LOGS_PREFIX = os.environ.get('SESSION_LOGS_PREFIX', 'session_logs/')
+SYSTEM_LOGS_PREFIX = os.environ.get('SYSTEM_LOGS_PREFIX', 'system_logs/')
+# entity values whose entity_id is a session_id -> routed to session_logs/;
+# everything else (user, websocket, driver, team, keywords_config) -> system_logs/.
+SESSION_SCOPED_ENTITIES = {'pipeline', 'session', 'session_config', 'recording'}
+ENVIRONMENT = os.environ.get('ENV', os.environ.get('STAGE', 'development')).lower()
+IS_PRODUCTION = ENVIRONMENT in ('prod', 'production')
+
+# When true, test drivers are ALWAYS hidden in production regardless of the
+# show-test-drivers toggle. Default is false, so the toggle controls visibility
+# in every environment (toggle ON shows the test driver, even in production).
+# Set this to 'true' only if you want a hard production block that the toggle
+# cannot override.
+HIDE_TEST_DRIVERS_IN_PROD = os.environ.get(
+    'HIDE_TEST_DRIVERS_IN_PROD', 'false').strip().lower() in ('true', '1', 'yes')
+
+
+def _truthy(value):
+    return str(value).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def should_show_test_drivers(toggle_value):
+    """Decide whether test drivers should be visible.
+
+    Default is ON (shown) — test drivers are enabled unless the toggle is
+    explicitly turned off (show_test_drivers=false). In production, the
+    HIDE_TEST_DRIVERS_IN_PROD option (off by default) can force them hidden
+    regardless of the toggle."""
+    if IS_PRODUCTION and HIDE_TEST_DRIVERS_IN_PROD:
+        return False
+    if toggle_value is None or str(toggle_value).strip() == '':
+        return True
+    return _truthy(toggle_value)
+
+
+def get_created_by(data):
+    """Resolve the acting login user from the request body.
+
+    The frontend sends `created_by` (the logged-in user's username/email).
+    Falls back to 'unknown' so a missing field never blocks the request."""
+    if isinstance(data, dict):
+        actor = data.get('created_by') or data.get('username')
+        if actor:
+            return str(actor).strip()
+    return 'unknown'
+
+
+def record_audit_event(action, entity, entity_id, created_by, details=None):
+    """Write an audit-trail record to S3 as a single JSON object, in three
+    places:
+      * {prefix}YYYY/MM/DD/{action}_{epoch}_{id}.json  - date partition
+        (original layout, unchanged; this app's own /audit-logs endpoint
+        reads from here).
+      * session_logs/{session_id}/{action}_{epoch}_{id}.json  - for
+        session-scoped events (entity in SESSION_SCOPED_ENTITIES), so "every
+        event for session X" is one S3 ListObjectsV2 prefix call.
+      * system_logs/YYYY/MM/DD/{action}_{epoch}_{id}.json  - for everything
+        else (auth, websocket connections, driver/team/keywords config).
+
+    No-op if AUDIT_S3_BUCKET is not configured. Never raises — audit logging
+    must not break the primary request flow."""
+    if not AUDIT_S3_BUCKET:
+        return
+    try:
+        now = datetime.utcnow()
+        record = {
+            'audit_id': str(uuid.uuid4()),
+            'timestamp': now.isoformat() + 'Z',
+            'action': action,
+            'entity': entity,
+            'entity_id': str(entity_id) if entity_id is not None else '',
+            'created_by': created_by or 'unknown',
+            'details': details or {}
+        }
+        suffix = f"{action}_{int(now.timestamp())}_{record['audit_id'][:8]}.json"
+        body = json.dumps(record, default=str).encode('utf-8')
+        date_path = now.strftime('%Y/%m/%d')
+        s3_client.put_object(
+            Bucket=AUDIT_S3_BUCKET,
+            Key=f"{AUDIT_S3_PREFIX}{date_path}/{suffix}",
+            Body=body,
+            ContentType='application/json'
+        )
+        if entity in SESSION_SCOPED_ENTITIES and record['entity_id']:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SESSION_LOGS_PREFIX}{record['entity_id']}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+        else:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SYSTEM_LOGS_PREFIX}{date_path}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+    except Exception as e:
+        print(f"[AUDIT] Failed to record {action} for {entity}:{entity_id}: {e}")
+
+
+def is_test_driver(driver):
+    """True if this driver is a test/dummy driver that must be hidden in
+    production. Matches an explicit is_test flag, or 'test' in the id/name."""
+    if not isinstance(driver, dict):
+        return False
+    if str(driver.get('is_test', '')).strip().lower() in ('true', '1', 'yes'):
+        return True
+    ident = f"{driver.get('driver_id', '')} {driver.get('driver_name', '')}".lower()
+    return 'test' in ident
+
+
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+}
+
+
+def decimal_default(obj):
+    """Handle Decimal serialization for JSON"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def response(status_code, body):
+    """Create API Gateway response"""
+    return {
+        'statusCode': status_code,
+        'headers': CORS_HEADERS,
+        'body': json.dumps(body, default=decimal_default)
+    }
+
+
+def lambda_handler(event, context):
+    """Main Lambda handler - routes requests to appropriate handlers"""
+    print(f"Received event: {json.dumps(event)}")
+
+    http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', ''))
+    if http_method == 'OPTIONS':
+        return response(200, {'message': 'OK'})
+
+    path = event.get('path', event.get('rawPath', ''))
+
+    if '/session-config' in path:
+        return handle_session_config(event, http_method)
+    elif '/drivers-batch' in path:
+        return handle_drivers_batch(event, http_method)
+    elif '/driver-config' in path:
+        return handle_driver_config(event, http_method)
+    elif '/team-config' in path:
+        return handle_team_config(event, http_method)
+    elif '/keywords-config' in path:
+        return handle_keywords_config(event, http_method)
+    elif '/upload-recording' in path:
+        return handle_upload_recording(event, http_method)
+    elif '/recording-status' in path:
+        return handle_recording_status(event, http_method)
+    elif '/list-recordings' in path or '/recordings' in path:
+        return handle_list_recordings(event, http_method)
+    elif '/transcriptions' in path:
+        return handle_transcriptions(event, http_method)
+    elif '/full-audio' in path:
+        return handle_full_audio(event, http_method)
+    elif '/mark-relevant' in path:
+        return handle_mark_relevant(event, http_method)
+    elif '/relevant-messages' in path:
+        return handle_relevant_messages(event, http_method)
+    elif '/audit-logs' in path:
+        return handle_audit_logs(event, http_method)
+    else:
+        return response(404, {'error': 'Endpoint not found'})
+
+
+
+def handle_audit_logs(event, method):
+    """Read audit-trail events from S3 for viewing in the app.
+
+    GET /audit-logs?date=YYYY-MM-DD&action=...&created_by=...&entity=...&limit=N
+
+    Lists the per-event JSON objects under audit-logs/YYYY/MM/DD/ for the given
+    day (default: today, UTC), optionally filtered, returned newest-first.
+
+    Requires the Lambda role to have s3:ListBucket + s3:GetObject on the audit
+    bucket."""
+    if method != 'GET':
+        return response(405, {'error': 'Method not allowed'})
+    if not AUDIT_S3_BUCKET:
+        return response(500, {'error': 'AUDIT_S3_BUCKET is not configured'})
+
+    params = event.get('queryStringParameters') or {}
+    date_str = params.get('date') or datetime.utcnow().strftime('%Y-%m-%d')
+    try:
+        y, m, d = date_str.split('-')
+        day_prefix = f"{AUDIT_S3_PREFIX}{y}/{m}/{d}/"
+    except ValueError:
+        return response(400, {'error': 'date must be in YYYY-MM-DD format'})
+
+    action_filter = (params.get('action') or '').strip().upper()
+    created_by_filter = (params.get('created_by') or '').strip().lower()
+    entity_filter = (params.get('entity') or '').strip().lower()
+    try:
+        limit = int(params.get('limit', '200'))
+    except ValueError:
+        limit = 200
+    limit = max(1, min(limit, 1000))
+
+    # Cap how many objects we read so a busy day can't time the Lambda out.
+    MAX_SCAN = 2000
+    events = []
+    scanned = 0
+    truncated = False
+    try:
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=AUDIT_S3_BUCKET, Prefix=day_prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if not key.endswith('.json'):
+                    continue
+                if scanned >= MAX_SCAN:
+                    truncated = True
+                    break
+                scanned += 1
+                try:
+                    body = s3_client.get_object(
+                        Bucket=AUDIT_S3_BUCKET, Key=key)['Body'].read()
+                    rec = json.loads(body)
+                except Exception as e:
+                    print(f"[AUDIT_READ] Skipping {key}: {e}")
+                    continue
+                if action_filter and str(rec.get('action', '')).upper() != action_filter:
+                    continue
+                if created_by_filter and str(rec.get('created_by', '')).lower() != created_by_filter:
+                    continue
+                if entity_filter and str(rec.get('entity', '')).lower() != entity_filter:
+                    continue
+                events.append(rec)
+            if truncated:
+                break
+    except Exception as e:
+        print(f"[AUDIT_READ] Error reading audit logs: {e}")
+        return response(500, {'error': str(e)})
+
+    events.sort(key=lambda r: r.get('timestamp', ''), reverse=True)
+    events = events[:limit]
+
+    return response(200, {
+        'date': date_str,
+        'count': len(events),
+        'truncated': truncated,
+        'audit_logs': events
+    })
+
+
+def handle_session_config(event, method):
+    """
+    Handle session configuration CRUD operations
+
+    Session config includes:
+    - session_name: Name of the session (e.g., "Practice 1", "Qualifying")
+    - start_time: ISO format datetime when transcription should start
+    - end_time: ISO format datetime when transcription should stop
+    - event_date: Date of the event (YYYY-MM-DD)
+    - status: scheduled, active, completed
+    """
+    table = dynamodb.Table(SESSION_CONFIG_TABLE)
+
+    if method == 'GET':
+        params = event.get('queryStringParameters') or {}
+        session_id = params.get('session_id')
+
+        if session_id:
+            result = table.get_item(Key={'session_id': session_id})
+            item = result.get('Item')
+            if item:
+                return response(200, {'session': item})
+            return response(404, {'error': 'Session not found'})
+        else:
+            result = table.scan()
+            return response(200, {'sessions': result.get('Items', [])})
+
+    elif method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+
+            session_id = body.get('session_id') or str(uuid.uuid4())
+            session_name = body.get('session_name')
+            start_time = body.get('start_time')
+            end_time = body.get('end_time')
+            event_date = body.get('event_date')
+
+            if not session_name or not start_time or not end_time:
+                return response(400, {'error': 'session_name, start_time, and end_time are required'})
+
+            created_by = get_created_by(body)
+            item = {
+                'session_id': session_id,
+                'session_name': session_name,
+                'start_time': start_time,
+                'end_time': end_time,
+                'event_date': event_date or start_time[:10],
+                'status': 'scheduled',
+                'created_by': created_by,
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+
+            table.put_item(Item=item)
+            record_audit_event('SESSION_CONFIG_CREATE', 'session_config', session_id,
+                               created_by, {'session_name': session_name})
+            return response(201, {'message': 'Session created', 'session': item})
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error creating session: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'PUT':
+        try:
+            body = json.loads(event.get('body', '{}'))
+            session_id = body.get('session_id')
+
+            if not session_id:
+                return response(400, {'error': 'session_id is required'})
+
+            update_expr = "SET updated_at = :updated_at"
+            expr_values = {':updated_at': datetime.utcnow().isoformat()}
+
+            for field in ['session_name', 'start_time', 'end_time', 'event_date', 'status']:
+                if field in body:
+                    update_expr += f", {field} = :{field}"
+                    expr_values[f':{field}'] = body[field]
+
+            table.update_item(
+                Key={'session_id': session_id},
+                UpdateExpression=update_expr,
+                ExpressionAttributeValues=expr_values
+            )
+
+            record_audit_event('SESSION_CONFIG_UPDATE', 'session_config', session_id,
+                               get_created_by(body),
+                               {'updated_fields': [k for k in body if k != 'created_by']})
+            return response(200, {'message': 'Session updated'})
+
+        except Exception as e:
+            print(f"Error updating session: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'DELETE':
+        params = event.get('queryStringParameters') or {}
+        session_id = params.get('session_id')
+
+        if not session_id:
+            return response(400, {'error': 'session_id is required'})
+
+        table.delete_item(Key={'session_id': session_id})
+        record_audit_event('SESSION_CONFIG_DELETE', 'session_config', session_id,
+                           params.get('created_by') or 'unknown')
+        return response(200, {'message': 'Session deleted'})
+
+    return response(405, {'error': 'Method not allowed'})
+
+
+
+def handle_driver_config(event, method):
+    """
+    Handle driver configuration CRUD operations
+
+    Driver config includes:
+    - driver_id: Unique identifier for the driver (partition key)
+    - driver_name: Name of the driver
+    - driver_number: Driver's racing number
+    - team: Team name
+    - team_color_code: Hex color code for team identification in UI (e.g., "#0000FF")
+    - stream_url: M3U8 stream URL for live audio
+    - driver_address: IP address of driver device
+    - color_code: Hex color code for driver identification in UI (e.g., "#FF5733")
+    - is_active: Whether this config is active
+    """
+    table = dynamodb.Table(DRIVER_CONFIG_TABLE)
+
+    if method == 'GET':
+        params = event.get('queryStringParameters') or {}
+        driver_id = params.get('driver_id')
+
+        # Toggle from the create-session screen: ?show_test_drivers=true shows
+        # test drivers; default (off/absent) hides them.
+        show_test = should_show_test_drivers(params.get('show_test_drivers'))
+
+        if driver_id:
+            result = table.get_item(Key={'driver_id': driver_id})
+            item = result.get('Item')
+            if item and (show_test or not is_test_driver(item)):
+                return response(200, {'driver_config': item})
+            return response(404, {'error': 'Driver configuration not found'})
+        else:
+            result = table.scan()
+            drivers = result.get('Items', [])
+            if not show_test:
+                drivers = [d for d in drivers if not is_test_driver(d)]
+            return response(200, {'driver_configs': drivers})
+
+    elif method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+
+            driver_id = str(uuid.uuid4())
+            driver_name = body.get('driver_name')
+            driver_number = body.get('driver_number')
+            team = body.get('team')
+            team_color_code = body.get('team_color_code', '')
+            stream_url = body.get('stream_url', '')
+            driver_address = body.get('driver_address', '')
+            color_code = body.get('color_code', '')
+            is_active = body.get('is_active', True)
+            is_test = bool(body.get('is_test', False))
+
+            if not driver_name:
+                return response(400, {'error': 'driver_name is required'})
+
+            created_by = get_created_by(body)
+            item = {
+                'driver_id': driver_id,
+                'driver_name': driver_name,
+                'driver_number': str(driver_number) if driver_number else '',
+                'team': team or '',
+                'team_color_code': team_color_code,
+                'stream_url': stream_url,
+                'driver_address': driver_address,
+                'color_code': color_code,
+                'is_active': is_active,
+                'is_test': is_test,
+                'created_by': created_by,
+                'created_at': datetime.utcnow().isoformat() + 'Z',
+                'updated_at': datetime.utcnow().isoformat() + 'Z'
+            }
+
+            table.put_item(Item=item)
+            record_audit_event('DRIVER_CREATE', 'driver', driver_id, created_by,
+                               {'driver_name': driver_name, 'is_test': is_test})
+            return response(201, {'message': 'Driver configuration created', 'driver_config': item})
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error creating driver config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'PUT':
+        try:
+            body = json.loads(event.get('body', '{}'))
+            driver_id = body.get('driver_id')
+
+            if not driver_id:
+                return response(400, {'error': 'driver_id is required'})
+
+            update_expr = "SET updated_at = :updated_at"
+            expr_values = {':updated_at': datetime.utcnow().isoformat() + 'Z'}
+
+            for field in ['driver_name', 'driver_number', 'team', 'team_color_code', 'stream_url', 'driver_address', 'color_code', 'is_active', 'is_test']:
+                if field in body:
+                    value = body[field]
+                    if field == 'driver_number':
+                        value = str(value) if value else ''
+                    update_expr += f", {field} = :{field}"
+                    expr_values[f':{field}'] = value
+
+            table.update_item(
+                Key={'driver_id': driver_id},
+                UpdateExpression=update_expr,
+                ExpressionAttributeValues=expr_values
+            )
+
+            record_audit_event('DRIVER_UPDATE', 'driver', driver_id, get_created_by(body),
+                               {'updated_fields': [k for k in body if k != 'created_by']})
+            return response(200, {'message': 'Driver configuration updated'})
+
+        except Exception as e:
+            print(f"Error updating driver config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'DELETE':
+        params = event.get('queryStringParameters') or {}
+        driver_id = params.get('driver_id')
+
+        if not driver_id:
+            return response(400, {'error': 'driver_id is required'})
+
+        table.delete_item(Key={'driver_id': driver_id})
+        record_audit_event('DRIVER_DELETE', 'driver', driver_id,
+                           params.get('created_by') or 'unknown')
+        return response(200, {'message': 'Driver configuration deleted'})
+
+    return response(405, {'error': 'Method not allowed'})
+
+
+
+def handle_drivers_batch(event, method):
+    """
+    Handle batch driver creation - add multiple drivers at once
+
+    POST /drivers-batch
+    Request body:
+    {
+        "drivers": [
+            {
+                "driver_name": "Colton Herta",
+                "driver_number": "26",
+                "team": "Andretti",
+                "team_color_code": "#0000FF",
+                "stream_url": "http://example.com/stream1.m3u8",
+                "driver_address": "192.168.1.1",
+                "color_code": "#FF5733",
+                "is_active": true
+            },
+            {
+                "driver_name": "Kyle Kirkwood",
+                "driver_number": "27",
+                "team": "Andretti",
+                "team_color_code": "#0000FF",
+                "color_code": "#33FF57"
+            }
+        ]
+    }
+
+    Response:
+    {
+        "message": "3 drivers created successfully",
+        "created": [...],
+        "failed": [...]
+    }
+    """
+    table = dynamodb.Table(DRIVER_CONFIG_TABLE)
+
+    if method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+            drivers = body.get('drivers', [])
+
+            if not drivers:
+                return response(400, {'error': 'drivers array is required'})
+
+            if not isinstance(drivers, list):
+                return response(400, {'error': 'drivers must be an array'})
+
+            created = []
+            failed = []
+            batch_created_by = get_created_by(body)
+
+            for i, driver_data in enumerate(drivers):
+                driver_name = driver_data.get('driver_name')
+
+                if not driver_name:
+                    failed.append({
+                        'index': i,
+                        'error': 'driver_name is required',
+                        'data': driver_data
+                    })
+                    continue
+
+                try:
+                    driver_id = str(uuid.uuid4())
+                    driver_number = driver_data.get('driver_number')
+                    team = driver_data.get('team')
+                    team_color_code = driver_data.get('team_color_code', '')
+                    stream_url = driver_data.get('stream_url', '')
+                    driver_address = driver_data.get('driver_address', '')
+                    color_code = driver_data.get('color_code', '')
+                    is_active = driver_data.get('is_active', True)
+                    is_test = bool(driver_data.get('is_test', False))
+
+                    item = {
+                        'driver_id': driver_id,
+                        'driver_name': driver_name,
+                        'driver_number': str(driver_number) if driver_number else '',
+                        'team': team or '',
+                        'team_color_code': team_color_code,
+                        'stream_url': stream_url,
+                        'driver_address': driver_address,
+                        'color_code': color_code,
+                        'is_active': is_active,
+                        'is_test': is_test,
+                        'created_by': batch_created_by,
+                        'created_at': datetime.utcnow().isoformat() + 'Z',
+                        'updated_at': datetime.utcnow().isoformat() + 'Z'
+                    }
+
+                    table.put_item(Item=item)
+                    created.append(item)
+
+                except Exception as e:
+                    failed.append({
+                        'index': i,
+                        'driver_name': driver_name,
+                        'error': str(e)
+                    })
+
+            record_audit_event('DRIVER_BATCH_CREATE', 'driver', None, batch_created_by, {
+                'created_ids': [d['driver_id'] for d in created],
+                'total_created': len(created),
+                'total_failed': len(failed)
+            })
+
+            return response(201, {
+                'message': f'{len(created)} driver(s) created successfully',
+                'created': created,
+                'failed': failed,
+                'total_submitted': len(drivers),
+                'total_created': len(created),
+                'total_failed': len(failed)
+            })
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error in batch driver creation: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'DELETE':
+        """
+        Batch delete multiple drivers at once
+
+        DELETE /drivers-batch
+        Request body:
+        {
+            "driver_ids": ["uuid-1", "uuid-2", "uuid-3"]
+        }
+
+        Response:
+        {
+            "message": "3 driver(s) deleted successfully",
+            "deleted": ["uuid-1", "uuid-2", "uuid-3"],
+            "failed": [],
+            "total_submitted": 3,
+            "total_deleted": 3,
+            "total_failed": 0
+        }
+        """
+        try:
+            body = json.loads(event.get('body', '{}'))
+            driver_ids = body.get('driver_ids', [])
+
+            if not driver_ids:
+                return response(400, {'error': 'driver_ids array is required'})
+
+            if not isinstance(driver_ids, list):
+                return response(400, {'error': 'driver_ids must be an array'})
+
+            deleted = []
+            failed = []
+
+            for driver_id in driver_ids:
+                if not driver_id:
+                    failed.append({
+                        'driver_id': driver_id,
+                        'error': 'driver_id cannot be empty'
+                    })
+                    continue
+
+                try:
+                    result = table.get_item(Key={'driver_id': driver_id})
+                    if not result.get('Item'):
+                        failed.append({
+                            'driver_id': driver_id,
+                            'error': 'Driver not found'
+                        })
+                        continue
+
+                    table.delete_item(Key={'driver_id': driver_id})
+                    deleted.append(driver_id)
+
+                except Exception as e:
+                    failed.append({
+                        'driver_id': driver_id,
+                        'error': str(e)
+                    })
+
+            record_audit_event('DRIVER_BATCH_DELETE', 'driver', None, get_created_by(body), {
+                'deleted_ids': deleted,
+                'total_deleted': len(deleted),
+                'total_failed': len(failed)
+            })
+
+            return response(200, {
+                'message': f'{len(deleted)} driver(s) deleted successfully',
+                'deleted': deleted,
+                'failed': failed,
+                'total_submitted': len(driver_ids),
+                'total_deleted': len(deleted),
+                'total_failed': len(failed)
+            })
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error in batch driver deletion: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    return response(405, {'error': 'Method not allowed. Use POST to create or DELETE to remove multiple drivers.'})
+
+
+
+def handle_team_config(event, method):
+    """
+    Handle team configuration CRUD operations
+
+    Team config includes:
+    - team_id: Unique identifier for the team (partition key, auto-generated UUID)
+    - team_name: Name of the team (e.g., "Andretti", "Porsche", "Jaguar")
+    - team_color_code: Hex color code for team identification in UI (e.g., "#0000FF")
+    - logo_url: URL to team logo image (optional)
+    - is_active: Whether this team config is active
+
+    Endpoints:
+    - GET /team-config - List all teams
+    - GET /team-config?team_id=xxx - Get specific team
+    - POST /team-config - Create new team
+    - PUT /team-config - Update existing team
+    - DELETE /team-config?team_id=xxx - Delete team
+    """
+    table = dynamodb.Table(TEAM_CONFIG_TABLE)
+
+    if method == 'GET':
+        params = event.get('queryStringParameters') or {}
+        team_id = params.get('team_id')
+
+        if team_id:
+            result = table.get_item(Key={'team_id': team_id})
+            item = result.get('Item')
+            if item:
+                return response(200, {'team_config': item})
+            return response(404, {'error': 'Team configuration not found'})
+        else:
+            result = table.scan()
+            return response(200, {'team_configs': result.get('Items', [])})
+
+    elif method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+
+            team_id = str(uuid.uuid4())
+            team_name = body.get('team_name')
+            team_color_code = body.get('team_color_code', '')
+            logo_url = body.get('logo_url', '')
+            is_active = body.get('is_active', True)
+
+            if not team_name:
+                return response(400, {'error': 'team_name is required'})
+
+            created_by = get_created_by(body)
+            item = {
+                'team_id': team_id,
+                'team_name': team_name,
+                'team_color_code': team_color_code,
+                'logo_url': logo_url,
+                'is_active': is_active,
+                'created_by': created_by,
+                'created_at': datetime.utcnow().isoformat() + 'Z',
+                'updated_at': datetime.utcnow().isoformat() + 'Z'
+            }
+
+            table.put_item(Item=item)
+            record_audit_event('TEAM_CREATE', 'team', team_id, created_by,
+                               {'team_name': team_name})
+            return response(201, {'message': 'Team configuration created', 'team_config': item})
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error creating team config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'PUT':
+        try:
+            body = json.loads(event.get('body', '{}'))
+            team_id = body.get('team_id')
+
+            if not team_id:
+                return response(400, {'error': 'team_id is required'})
+
+            update_expr = "SET updated_at = :updated_at"
+            expr_values = {':updated_at': datetime.utcnow().isoformat() + 'Z'}
+
+            for field in ['team_name', 'team_color_code', 'logo_url', 'is_active']:
+                if field in body:
+                    update_expr += f", {field} = :{field}"
+                    expr_values[f':{field}'] = body[field]
+
+            table.update_item(
+                Key={'team_id': team_id},
+                UpdateExpression=update_expr,
+                ExpressionAttributeValues=expr_values
+            )
+
+            record_audit_event('TEAM_UPDATE', 'team', team_id, get_created_by(body),
+                               {'updated_fields': [k for k in body if k != 'created_by']})
+            return response(200, {'message': 'Team configuration updated'})
+
+        except Exception as e:
+            print(f"Error updating team config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'DELETE':
+        params = event.get('queryStringParameters') or {}
+        team_id = params.get('team_id')
+
+        if not team_id:
+            return response(400, {'error': 'team_id is required'})
+
+        table.delete_item(Key={'team_id': team_id})
+        record_audit_event('TEAM_DELETE', 'team', team_id,
+                           params.get('created_by') or 'unknown')
+        return response(200, {'message': 'Team configuration deleted'})
+
+    return response(405, {'error': 'Method not allowed'})
+
+
+
+def handle_keywords_config(event, method):
+    """
+    Handle keywords configuration CRUD operations
+
+    Keywords config includes:
+    - config_id: Unique identifier
+    - config_name: Name for this keyword set
+    - keywords: List of keyword objects with 'keyword' and 'color' fields
+    - is_active: Whether this config is active
+
+    Example keywords:
+    [
+        {"keyword": "box", "color": "#FF0000"},
+        {"keyword": "pit stop", "color": "#00FF00"},
+        {"keyword": "safety car", "color": "#FFFF00"}
+    ]
+    """
+    table = dynamodb.Table(KEYWORDS_CONFIG_TABLE)
+
+    if method == 'GET':
+        params = event.get('queryStringParameters') or {}
+        config_id = params.get('config_id')
+
+        if config_id:
+            result = table.get_item(Key={'config_id': config_id})
+            item = result.get('Item')
+            if item:
+                return response(200, {'keywords_config': item})
+            return response(404, {'error': 'Keywords configuration not found'})
+        else:
+            result = table.scan()
+            items = result.get('Items', [])
+            active_configs = [i for i in items if i.get('is_active', True)]
+            return response(200, {'keywords_configs': active_configs})
+
+    elif method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+
+            config_id = body.get('config_id') or str(uuid.uuid4())
+            config_name = body.get('config_name', 'Default Keywords')
+            keywords = body.get('keywords', [])
+
+            if not keywords:
+                return response(400, {'error': 'keywords list is required'})
+
+            for kw in keywords:
+                if 'keyword' not in kw or 'color' not in kw:
+                    return response(400, {'error': 'Each keyword must have "keyword" and "color" fields'})
+
+            created_by = get_created_by(body)
+            item = {
+                'config_id': config_id,
+                'config_name': config_name,
+                'keywords': keywords,
+                'is_active': True,
+                'created_by': created_by,
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+
+            table.put_item(Item=item)
+            record_audit_event('KEYWORDS_CREATE', 'keywords_config', config_id, created_by,
+                               {'config_name': config_name, 'count': len(keywords)})
+            return response(201, {'message': 'Keywords configuration created', 'keywords_config': item})
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error creating keywords config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'PUT':
+        try:
+            params = event.get('queryStringParameters') or {}
+            keyword_to_update = params.get('keyword')
+            body = json.loads(event.get('body', '{}'))
+
+            if keyword_to_update:
+                new_color = body.get('color')
+                new_keyword_name = body.get('new_keyword')
+
+                if not new_color and not new_keyword_name:
+                    return response(400, {'error': 'At least one of "color" or "new_keyword" is required in body'})
+
+                result = table.scan()
+                configs = [item for item in result.get('Items', []) if item.get('is_active', True)]
+
+                if not configs:
+                    return response(404, {'error': 'No active keywords configuration found'})
+
+                keyword_updated = False
+                for config in configs:
+                    current_keywords = config.get('keywords', [])
+                    updated = False
+
+                    for kw in current_keywords:
+                        if kw.get('keyword') == keyword_to_update:
+                            if new_color:
+                                kw['color'] = new_color
+                            if new_keyword_name:
+                                kw['keyword'] = new_keyword_name
+                            updated = True
+                            keyword_updated = True
+
+                    if updated:
+                        table.update_item(
+                            Key={'config_id': config['config_id']},
+                            UpdateExpression="SET keywords = :keywords, updated_at = :updated_at",
+                            ExpressionAttributeValues={
+                                ':keywords': current_keywords,
+                                ':updated_at': datetime.utcnow().isoformat()
+                            }
+                        )
+
+                if keyword_updated:
+                    record_audit_event('KEYWORD_UPDATE', 'keywords_config', keyword_to_update,
+                                       get_created_by(body),
+                                       {'new_color': new_color, 'new_keyword': new_keyword_name})
+                    return response(200, {
+                        'message': f'Keyword "{keyword_to_update}" updated successfully'
+                    })
+                else:
+                    return response(404, {'error': f'Keyword "{keyword_to_update}" not found'})
+
+            else:
+                config_id = body.get('config_id')
+
+                if not config_id:
+                    return response(400, {'error': 'config_id is required'})
+
+                update_expr = "SET updated_at = :updated_at"
+                expr_values = {':updated_at': datetime.utcnow().isoformat()}
+
+                for field in ['config_name', 'keywords', 'is_active']:
+                    if field in body:
+                        update_expr += f", {field} = :{field}"
+                        expr_values[f':{field}'] = body[field]
+
+                table.update_item(
+                    Key={'config_id': config_id},
+                    UpdateExpression=update_expr,
+                    ExpressionAttributeValues=expr_values
+                )
+
+                record_audit_event('KEYWORDS_UPDATE', 'keywords_config', config_id,
+                                   get_created_by(body),
+                                   {'updated_fields': [k for k in body if k != 'created_by']})
+                return response(200, {'message': 'Keywords configuration updated'})
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error updating keywords config: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'DELETE':
+        params = event.get('queryStringParameters') or {}
+        config_id = params.get('config_id')
+        keyword_to_delete = params.get('keyword')
+
+        if keyword_to_delete:
+            try:
+                if config_id:
+                    result = table.get_item(Key={'config_id': config_id})
+                    configs_to_update = [result.get('Item')] if result.get('Item') else []
+                else:
+                    result = table.scan()
+                    configs_to_update = [item for item in result.get('Items', []) if item.get('is_active', True)]
+
+                if not configs_to_update:
+                    return response(404, {'error': 'No keywords configuration found'})
+
+                keyword_deleted = False
+                for config in configs_to_update:
+                    current_keywords = config.get('keywords', [])
+                    updated_keywords = [kw for kw in current_keywords if kw.get('keyword') != keyword_to_delete]
+
+                    if len(updated_keywords) < len(current_keywords):
+                        table.update_item(
+                            Key={'config_id': config['config_id']},
+                            UpdateExpression="SET keywords = :keywords, updated_at = :updated_at",
+                            ExpressionAttributeValues={
+                                ':keywords': updated_keywords,
+                                ':updated_at': datetime.utcnow().isoformat()
+                            }
+                        )
+                        keyword_deleted = True
+
+                if keyword_deleted:
+                    record_audit_event('KEYWORD_DELETE', 'keywords_config', keyword_to_delete,
+                                       params.get('created_by') or 'unknown')
+                    return response(200, {
+                        'message': f'Keyword "{keyword_to_delete}" deleted successfully'
+                    })
+                else:
+                    return response(404, {'error': f'Keyword "{keyword_to_delete}" not found'})
+
+            except Exception as e:
+                print(f"Error deleting keyword: {str(e)}")
+                return response(500, {'error': str(e)})
+        elif config_id:
+            table.delete_item(Key={'config_id': config_id})
+            record_audit_event('KEYWORDS_DELETE', 'keywords_config', config_id,
+                               params.get('created_by') or 'unknown')
+            return response(200, {'message': 'Keywords configuration deleted'})
+        else:
+            return response(400, {'error': 'Either keyword or config_id is required'})
+
+    return response(405, {'error': 'Method not allowed'})
+
+
+
+def handle_upload_recording(event, method):
+    """
+    Handle recorded file uploads
+
+    For recorded files (not live streams):
+    1. Generate presigned URL for direct S3 upload
+    2. File gets uploaded to S3 by frontend
+    3. S3 trigger activates silence_removal_lambda
+    4. Same pipeline as live stream from that point
+
+    Request body:
+    - session_id: Session to associate with
+    - driver_name: Display name of driver (e.g., "Colton Herta")
+    - team: Team name (optional, defaults to "UPLOADED")
+    - file_name: Original file name
+    - content_type: MIME type (default: audio/mpeg)
+
+    Note: Supports both old (driver_folder) and new (driver_name) field names for backward compatibility
+    - If driver_folder is provided, it is used as driver_name
+    - driver_folder in S3 path is auto-sanitized from driver_name
+    """
+    if method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+
+            session_id = body.get('session_id')
+            driver_name = body.get('driver_name') or body.get('driver_folder')
+            team = body.get('team', 'UPLOADED')
+            file_name = body.get('file_name')
+            content_type = body.get('content_type', 'audio/mpeg')
+
+            if not session_id or not driver_name or not file_name:
+                return response(400, {
+                    'error': 'session_id, driver_name (or driver_folder), and file_name are required'
+                })
+
+
+            # Auto-create a v2_SessionConfig entry for upload-flow sessions
+            # so they show up on the Pipeline Board (which reads its session
+            # list from this table). Live-flow sessions already get this via
+            # handle_session_config; uploads had no equivalent step.
+            try:
+                session_table_ref = dynamodb.Table(SESSION_CONFIG_TABLE)
+                existing_session = session_table_ref.get_item(Key={'session_id': session_id}).get('Item')
+                if not existing_session:
+                    now_iso = datetime.utcnow().isoformat()
+                    session_table_ref.put_item(Item={
+                        'session_id': session_id,
+                        'session_name': session_id,
+                        'start_time': now_iso,
+                        'end_time': now_iso,
+                        'event_date': now_iso[:10],
+                        'status': 'active',
+                        'created_by': get_created_by(body),
+                        'created_at': now_iso,
+                        'updated_at': now_iso
+                    })
+                    print(f"Created v2_SessionConfig entry for upload session: {session_id}")
+            except Exception as e:
+                print(f"Warning: could not create session config for {session_id}: {str(e)}")
+
+            driver_folder = sanitize_for_path(driver_name)
+
+            timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            file_extension = file_name.split('.')[-1] if '.' in file_name else 'mp3'
+
+            s3_key = f"{UPLOADS_PREFIX}{session_id}/{driver_folder}/recorded_{timestamp}.{file_extension}"
+
+            upload_metadata = {
+                "session_id": session_id,
+                "driver_folder": driver_folder,
+                "driver_name": driver_name,
+                "team": team,
+                "original_filename": file_name,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            metadata_key = f"{UPLOADS_PREFIX}{session_id}/{driver_folder}/upload_metadata.json"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=metadata_key,
+                Body=json.dumps(upload_metadata, indent=2),
+                ContentType="application/json"
+            )
+            print(f"Created upload metadata: {metadata_key}")
+
+            presigned_url = s3_client.generate_presigned_url(
+                'put_object',
+                Params={
+                    'Bucket': S3_BUCKET,
+                    'Key': s3_key,
+                    'ContentType': content_type
+                },
+                ExpiresIn=3600
+            )
+
+            record_audit_event('UPLOAD_RECORDING', 'recording', session_id,
+                               get_created_by(body),
+                               {'driver_name': driver_name, 'file_name': file_name, 's3_key': s3_key})
+
+            return response(200, {
+                'message': 'Upload URL generated',
+                'upload_url': presigned_url,
+                's3_key': s3_key,
+                'bucket': S3_BUCKET,
+                'driver_name': driver_name,
+                'team': team,
+                'expires_in': 3600
+            })
+
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error generating upload URL: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    elif method == 'GET':
+        params = event.get('queryStringParameters') or {}
+        session_id = params.get('session_id')
+
+        if not session_id:
+            return response(400, {'error': 'session_id is required'})
+
+        try:
+            prefix = f"{RAW_CHUNKS_PREFIX}{session_id}/"
+            result = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                Prefix=prefix
+            )
+
+            files = []
+            for obj in result.get('Contents', []):
+                files.append({
+                    'key': obj['Key'],
+                    'size': obj['Size'],
+                    'last_modified': obj['LastModified'].isoformat()
+                })
+
+            return response(200, {'files': files})
+
+        except Exception as e:
+            print(f"Error listing files: {str(e)}")
+            return response(500, {'error': str(e)})
+
+    return response(405, {'error': 'Method not allowed'})
+
+
+
+def handle_recording_status(event, method):
+    """
+    Get processing status for uploaded recordings.
+
+    This endpoint checks the pipeline stages to determine processing status:
+    1. uploads/ - Files waiting to be chunked
+    2. raw-chunks/ - Files chunked, waiting for silence removal
+    3. cleaned-audio/ - Files cleaned, waiting for transcription
+    4. OpenSearch - Transcriptions completed
+
+    Query Parameters:
+    - session_id (required): The session ID to check status for
+
+    Response:
+    {
+        "session_id": "Monaco_GP_2026-01-04",
+        "status": "PROCESSING",  // PENDING, PROCESSING, COMPLETED, NOT_FOUND
+        "drivers": [
+            {
+                "driver_name": "Colton_Herta",
+                "status": "COMPLETED",
+                "uploads_count": 0,
+                "raw_chunks_count": 10,
+                "cleaned_count": 10,
+                "transcriptions_s3_count": 10,
+                "transcriptions_opensearch_count": 10
+            }
+        ],
+        "summary": {
+            "total_uploads": 0,
+            "total_raw_chunks": 18,
+            "total_cleaned": 15,
+            "total_transcriptions_s3": 13,
+            "total_transcriptions_opensearch": 13,
+            "progress_percent": 72
+        }
+    }
+    """
+    if method != 'GET':
+        return response(405, {'error': 'Method not allowed'})
+
+    try:
+        params = event.get('queryStringParameters') or {}
+        session_id = params.get('session_id')
+
+        if not session_id:
+            return response(400, {'error': 'session_id is required'})
+
+        uploads_prefix = f"uploads/{session_id}/"
+        raw_chunks_prefix = f"raw-chunks/{session_id}/"
+        cleaned_prefix = f"silence-removed/{session_id}/"
+        transcriptions_prefix = f"transcriptions/{session_id}/"
+
+        uploads_files = list_s3_files(uploads_prefix)
+        raw_chunks_files = list_s3_files(raw_chunks_prefix)
+        cleaned_files = list_s3_files(cleaned_prefix)
+        transcriptions_files = list_s3_files(transcriptions_prefix)
+
+        drivers_data = {}
+
+        for file_key in uploads_files:
+            parts = file_key.replace(uploads_prefix, '').split('/')
+            if len(parts) >= 1:
+                driver = parts[0]
+                if driver and not driver.endswith('.json'):
+                    if driver not in drivers_data:
+                        drivers_data[driver] = {'uploads': 0, 'raw_chunks': 0, 'cleaned': 0, 'transcriptions_s3': 0}
+                    drivers_data[driver]['uploads'] += 1
+
+        for file_key in raw_chunks_files:
+            parts = file_key.replace(raw_chunks_prefix, '').split('/')
+            if len(parts) >= 1:
+                driver = parts[0]
+                if driver and not file_key.endswith('.json'):
+                    if driver not in drivers_data:
+                        drivers_data[driver] = {'uploads': 0, 'raw_chunks': 0, 'cleaned': 0, 'transcriptions_s3': 0}
+                    drivers_data[driver]['raw_chunks'] += 1
+
+        for file_key in cleaned_files:
+            parts = file_key.replace(cleaned_prefix, '').split('/')
+            if len(parts) >= 1:
+                driver = parts[0]
+                if driver and not file_key.endswith('.json'):
+                    if driver not in drivers_data:
+                        drivers_data[driver] = {'uploads': 0, 'raw_chunks': 0, 'cleaned': 0, 'transcriptions_s3': 0}
+                    drivers_data[driver]['cleaned'] += 1
+
+        for file_key in transcriptions_files:
+            parts = file_key.replace(transcriptions_prefix, '').split('/')
+            if len(parts) >= 1:
+                driver = parts[0]
+                if driver:
+                    if driver not in drivers_data:
+                        drivers_data[driver] = {'uploads': 0, 'raw_chunks': 0, 'cleaned': 0, 'transcriptions_s3': 0}
+                    if file_key.endswith('.json') and 'metadata' not in file_key and '.tmp' not in file_key:
+                        drivers_data[driver]['transcriptions_s3'] += 1
+
+        opensearch_total = get_opensearch_total_count(session_id)
+        print(f"OpenSearch total count: {opensearch_total}")
+
+        dynamodb_total = get_dynamodb_total_count(session_id)
+        print(f"DynamoDB total count: {dynamodb_total}")
+
+        drivers_list = []
+        total_uploads = 0
+        total_raw_chunks = 0
+        total_cleaned = 0
+        total_transcriptions_s3 = 0
+
+        for driver_name, counts in drivers_data.items():
+            transcription_count = counts['transcriptions_s3']
+
+            if counts['uploads'] > 0:
+                driver_status = 'PENDING'
+            elif counts['raw_chunks'] > transcription_count:
+                driver_status = 'PROCESSING'
+            elif transcription_count > 0:
+                driver_status = 'COMPLETED'
+            else:
+                driver_status = 'PENDING'
+
+            drivers_list.append({
+                'driver_name': driver_name,
+                'status': driver_status,
+                'uploads_count': counts['uploads'],
+                'raw_chunks_count': counts['raw_chunks'],
+                'cleaned_count': counts['cleaned'],
+                'transcriptions_s3_count': counts['transcriptions_s3']
+            })
+
+            total_uploads += counts['uploads']
+            total_raw_chunks += counts['raw_chunks']
+            total_cleaned += counts['cleaned']
+            total_transcriptions_s3 += counts['transcriptions_s3']
+
+
+
+        session_stopped = False
+        try:
+            active_sessions_table = dynamodb.Table(os.environ.get('ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions'))
+            session_result = active_sessions_table.get_item(Key={'SessionId': session_id})
+            if 'Item' in session_result:
+                session_db_status = session_result['Item'].get('Status', '')
+                session_stopped = session_db_status == 'STOPPED'
+                print(f"Live session {session_id} status: {session_db_status}, stopped: {session_stopped}")
+            else:
+                print(f"No ActiveSessions entry for {session_id} (likely an uploaded recording)")
+        except Exception as e:
+            print(f"Error checking session status from ActiveSessions: {e}")
+
+        COMPLETION_THRESHOLD = 0.75
+
+        if not drivers_data:
+            overall_status = 'NOT_FOUND'
+            progress_percent = 0
+        elif total_raw_chunks == 0 and total_transcriptions_s3 == 0:
+            overall_status = 'NOT_FOUND'
+            progress_percent = 0
+        elif session_stopped:
+            overall_status = 'COMPLETED'
+            progress_percent = 100
+        elif total_transcriptions_s3 > 0 and opensearch_total >= total_transcriptions_s3 * COMPLETION_THRESHOLD:
+            overall_status = 'COMPLETED'
+            progress_percent = 100
+        elif total_uploads > 0 and total_raw_chunks == 0:
+            overall_status = 'PENDING'
+            progress_percent = 0
+        else:
+            overall_status = 'PROCESSING'
+            if total_transcriptions_s3 > 0:
+                progress_percent = int((opensearch_total / total_transcriptions_s3) * 100)
+            else:
+                progress_percent = 0
+
+        return response(200, {
+            'session_id': session_id,
+            'status': overall_status,
+            'drivers': drivers_list,
+            'summary': {
+                'total_uploads': total_uploads,
+                'total_raw_chunks': total_raw_chunks,
+                'total_cleaned': total_cleaned,
+                'total_transcriptions_s3': total_transcriptions_s3,
+                'total_transcriptions_opensearch': opensearch_total,
+                'progress_percent': progress_percent
+            }
+        })
+
+    except Exception as e:
+        print(f"Error getting recording status: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return response(500, {'error': str(e)})
+    
+
+def _coerce_to_epoch_seconds(ts):
+    """Accept timestamp as float/int/numeric-string/ISO datetime string and return
+    a float of epoch seconds. Falls back to current time if input is None or
+    unparseable. Designed so /mark-relevant never rejects valid clicks just
+    because the frontend sent the timestamp in an unexpected shape."""
+    if ts is None or ts == "":
+        return datetime.utcnow().timestamp()
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(str(ts).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        pass
+    print(f"[RELEVANT] Could not parse timestamp '{ts}' — defaulting to now")
+    return datetime.utcnow().timestamp()
+
+
+def _extract_chunk_offset_seconds(audio_s3_key):
+    """Parse the chunk filename out of audio_s3_key (raw S3 key OR presigned URL)
+    and return seconds since the ECS chunker started recording. This is exactly
+    the value the live feed uses as `SessionTime` before subtracting prerace_buffer.
+
+    Supported filename patterns:
+      segment-00001-00m10s.mp3            -> 10
+      segment-00001-00m10s_recorded.mp3   -> 10
+      segment-00007.mp3 (fallback)        -> 7 * 10 = 70
+
+    Returns None if no pattern matches."""
+    if not audio_s3_key:
+        return None
+    s = str(audio_s3_key).split('?')[0]
+    filename = s.rsplit('/', 1)[-1]
+    m = re.search(r'-(\d+)m(\d+)s', filename)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.search(r'segment-(\d+)', filename)
+    if m:
+        return int(m.group(1)) * 10
+    return None
+
+
+def _get_session_timing(session_id):
+    """Return (started_at, race_start_ts) as epoch ints for the session, or
+    (0, 0) if unavailable. Mirrors the lookup used by the live WebSocket push
+    so prerace_buffer matches."""
+    started_at = 0
+    race_start_ts = 0
+    try:
+        from datetime import datetime as _dt
+        session_config_table = dynamodb.Table(os.environ.get('SESSION_TABLE', 'v2_SessionConfig'))
+        session_item = session_config_table.get_item(
+            Key={'session_id': session_id},
+            ConsistentRead=True
+        ).get('Item') or {}
+        if session_item.get('started_at'):
+            started_at = int(session_item['started_at'])
+        if session_item.get('start_time'):
+            race_start_ts = int(
+                _dt.fromisoformat(
+                    str(session_item['start_time']).replace('Z', '+00:00')
+                ).timestamp()
+            )
+    except Exception as e:
+        print(f"[RELEVANT] SessionConfig lookup failed ({e})")
+
+    if not started_at or not race_start_ts:
+        try:
+            active_sessions_table = dynamodb.Table(os.environ.get('ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions'))
+            active_item = active_sessions_table.get_item(
+                Key={'SessionId': session_id},
+                ConsistentRead=True
+            ).get('Item') or {}
+            if not started_at:
+                started_at = int(active_item.get('StartedAt', 0) or 0)
+            if not race_start_ts:
+                race_start_ts = int(active_item.get('RaceStartAt', 0) or 0)
+        except Exception as e:
+            print(f"[RELEVANT] ActiveSessions lookup failed ({e})")
+
+    return started_at, race_start_ts
+
+
+def _build_relevant_message_id(session_id, driver_id, driver, source_file, time, message):
+    """Deterministic MessageId hashed from natural identity fields.
+
+    Why: the previous uuid4 key meant each click inserted a fresh row, so on
+    refresh the frontend had no stable key to match a transcription line to a
+    relevant row — checkboxes that were just clicked rendered as unchecked.
+    With this hash, the same logical line always maps to the same MessageId,
+    put_item upserts cleanly, and the client can recompute the same id."""
+    import hashlib
+    key = '|'.join([
+        str(session_id or ''),
+        str(driver_id or driver or ''),
+        str(source_file or ''),
+        str(time or ''),
+        str(message or '')[:200],
+    ])
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()[:32]
+
+
+def mark_relevant_message(session_id, message, driver, team, timestamp, is_relevant,
+                          audio_s3_key=None, time=None, driver_id=None, source_file=None):
+    """Persist a marked-relevant row. Stores driver_id and source_file as
+    first-class columns so the WebSocket search handler can match by exact
+    chunk identity on refresh, no string parsing required."""
+    table = dynamodb.Table(RELEVANT_MESSAGES_TABLE)
+
+    if not source_file and audio_s3_key:
+        try:
+            source_file = str(audio_s3_key).split('?')[0].rsplit('/', 1)[-1]
+        except Exception:
+            source_file = None
+
+    message_id = _build_relevant_message_id(
+        session_id, driver_id, driver, source_file, time, message)
+
+    epoch_seconds = _coerce_to_epoch_seconds(timestamp)
+    try:
+        timestamp_decimal = Decimal(str(epoch_seconds))
+    except (InvalidOperation, ValueError):
+        timestamp_decimal = Decimal(str(datetime.utcnow().timestamp()))
+
+    resolved_time = str(time) if time else None
+
+    if not resolved_time:
+        try:
+            chunk_offset = _extract_chunk_offset_seconds(audio_s3_key or source_file)
+            started_at, race_start_ts = _get_session_timing(session_id)
+            if chunk_offset is not None and started_at and race_start_ts:
+                prerace_buffer = race_start_ts - started_at
+                resolved_time = _format_race_relative_seconds(chunk_offset - prerace_buffer)
+                print(f"[RELEVANT] Derived time from chunk: offset={chunk_offset}s, prerace_buffer={prerace_buffer}s, time={resolved_time}")
+        except Exception as e:
+            print(f"[RELEVANT] Could not derive time from chunk filename ({e})")
+
+    if not resolved_time:
+        try:
+            race_start_ts = _get_race_start_ts(session_id)
+            if race_start_ts:
+                resolved_time = _format_race_relative_seconds(int(epoch_seconds) - race_start_ts)
+        except Exception as compute_err:
+            print(f"[RELEVANT] Could not compute click-time fallback ({compute_err})")
+
+    if not resolved_time:
+        resolved_time = "00:00"
+
+    item = {
+        'SessionId': session_id,
+        'MessageId': message_id,
+        'message': message,
+        'driver': driver,
+        'team': team,
+        'timestamp': timestamp_decimal,
+        'is_relevant': is_relevant,
+        'time': resolved_time
+    }
+    if audio_s3_key:
+        item['audio_s3_path'] = f"s3://{S3_BUCKET}/{audio_s3_key}"
+    if driver_id:
+        item['driver_id'] = str(driver_id)
+    if source_file:
+        item['source_file'] = str(source_file)
+
+    # On deselect, remove matching relevant rows so they do not reappear after refresh.
+    if not is_relevant:
+        try:
+            existing_items = table.query(
+                KeyConditionExpression=Key('SessionId').eq(session_id),
+                ConsistentRead=True
+            ).get('Items', [])
+
+            def _is_match(it):
+                if str(it.get('MessageId', '')) == str(message_id):
+                    return True
+                if source_file and str(it.get('source_file', '')) == str(source_file):
+                    if driver_id and str(it.get('driver_id', '')) == str(driver_id):
+                        return True
+                if str(it.get('driver', '')) == str(driver) and str(it.get('time', '')) == str(resolved_time):
+                    return True
+                return False
+
+            removed = 0
+            for it in existing_items:
+                if _is_match(it):
+                    table.delete_item(Key={'SessionId': session_id, 'MessageId': it['MessageId']})
+                    removed += 1
+            print(f"[RELEVANT] Deselected message; removed {removed} row(s) for session {session_id}")
+        except Exception as e:
+            print(f"[RELEVANT] Failed to delete deselected message rows ({e}); storing is_relevant=false fallback")
+            table.put_item(Item=item)
+        return message_id
+
+    table.put_item(Item=item)
+    return message_id
+
+
+def _format_race_relative_seconds(delta_seconds):
+    """Format a signed integer offset (in seconds) into [-]MM:SS or [-]HH:MM:SS.
+    Negative = before race start (e.g. '-00:30'); zero/positive = at or after race
+    start (e.g. '00:00', '01:15')."""
+    try:
+        delta = int(delta_seconds)
+    except (TypeError, ValueError):
+        return "00:00"
+    sign = "-" if delta < 0 else ""
+    abs_delta = abs(delta)
+    hours = abs_delta // 3600
+    minutes = (abs_delta % 3600) // 60
+    seconds = abs_delta % 60
+    if hours > 0:
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{sign}{minutes:02d}:{seconds:02d}"
+
+
+def _parse_race_relative_to_seconds(t):
+    """Parse a stored [-]MM:SS or [-]HH:MM:SS string back to signed integer
+    seconds. Used as a sort key so rows are ordered by the actual conversation
+    moment, not by when the user clicked. Returns 0 for missing/unparseable."""
+    if not t:
+        return 0
+    s = str(t).strip()
+    sign = -1 if s.startswith('-') else 1
+    s = s.lstrip('-')
+    try:
+        parts = list(map(int, s.split(':')))
+    except (ValueError, AttributeError):
+        return 0
+    if len(parts) == 2:
+        return sign * (parts[0] * 60 + parts[1])
+    if len(parts) == 3:
+        return sign * (parts[0] * 3600 + parts[1] * 60 + parts[2])
+    return 0
+
+
+def _get_race_start_ts(session_id):
+    """Look up the session's actual race start time (epoch seconds).
+    Prefers v2_SessionConfig.start_time (the scheduled race start); falls back
+    to v2_ActiveSessions.RaceStartAt. Returns 0 if neither is available."""
+    try:
+        from datetime import datetime as _dt
+        session_config_table = dynamodb.Table(os.environ.get('SESSION_TABLE', 'v2_SessionConfig'))
+        session_item = session_config_table.get_item(
+            Key={'session_id': session_id},
+            ConsistentRead=True
+        ).get('Item') or {}
+        if session_item.get('start_time'):
+            return int(
+                _dt.fromisoformat(
+                    str(session_item['start_time']).replace('Z', '+00:00')
+                ).timestamp()
+            )
+    except Exception as e:
+        print(f"[RELEVANT] SessionConfig start_time lookup failed ({e})")
+    try:
+        active_sessions_table = dynamodb.Table(os.environ.get('ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions'))
+        active_item = active_sessions_table.get_item(
+            Key={'SessionId': session_id},
+            ConsistentRead=True
+        ).get('Item') or {}
+        return int(active_item.get('RaceStartAt', 0) or 0)
+    except Exception as e:
+        print(f"[RELEVANT] ActiveSessions RaceStartAt lookup failed ({e})")
+        return 0
+
+
+def get_relevant_messages(session_id):
+    table = dynamodb.Table(RELEVANT_MESSAGES_TABLE)
+    response = table.query(
+        KeyConditionExpression=Key('SessionId').eq(session_id),
+        ConsistentRead=True
+    )
+    items = response.get('Items', [])
+
+    legacy_items_need_race_start = any(not it.get('time') for it in items)
+    race_start_ts = _get_race_start_ts(session_id) if legacy_items_need_race_start else 0
+    if legacy_items_need_race_start:
+        print(f"[RELEVANT] session_id={session_id}, race_start_ts={race_start_ts} (legacy fallback)")
+
+    for item in items:
+        if 'timestamp' in item:
+            item['timestamp'] = float(item['timestamp'])
+        if 'is_relevant' not in item:
+            item['is_relevant'] = True
+
+        stored_time = item.get('time')
+        if stored_time:
+            item['time'] = str(stored_time)
+        elif race_start_ts and item.get('timestamp'):
+            item['time'] = _format_race_relative_seconds(int(item['timestamp']) - race_start_ts)
+        else:
+            item['time'] = "00:00"
+
+        audio_s3_path = item.get('audio_s3_path')
+        if audio_s3_path:
+            try:
+                audio_s3_key = audio_s3_path.split(f"s3://{S3_BUCKET}/")[-1]
+
+                audio_url = s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": S3_BUCKET, "Key": audio_s3_key},
+                    ExpiresIn=86400
+                )
+                item['audio_s3_key'] = audio_s3_key
+                item['AudioUrl'] = audio_url
+            except Exception as e:
+                print(f"Error regenerating audio URL: {e}")
+                item['AudioUrl'] = None
+
+    items = [it for it in items if it.get('is_relevant', True)]
+    items.sort(key=lambda x: _parse_race_relative_to_seconds(x.get('time')))
+    return items
+
+def handle_mark_relevant(event, method):
+    if method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}'))
+            session_id = body.get('session_id')
+            message = body.get('message')
+            driver = body.get('driver')
+            team = body.get('team')
+            timestamp = body.get('timestamp')
+            audio_s3_key = body.get('audio_s3_key')
+            is_relevant = body.get('is_relevant', True)
+            time = body.get('time')
+            driver_id = body.get('driver_id')
+            source_file = body.get('source_file')
+            if not all([session_id, message, driver]):
+                return response(400, {'error': 'session_id, message, and driver are required'})
+            team = team or ''
+            message_id = mark_relevant_message(
+                session_id=session_id,
+                message=message,
+                driver=driver,
+                team=team,
+                timestamp=timestamp,
+                audio_s3_key=audio_s3_key,
+                is_relevant=is_relevant,
+                time=time,
+                driver_id=driver_id,
+                source_file=source_file
+                )
+            record_audit_event(
+                'MARK_RELEVANT' if is_relevant else 'UNMARK_RELEVANT',
+                'relevant_message', session_id, get_created_by(body),
+                {'message_id': message_id, 'driver': driver, 'is_relevant': is_relevant})
+            return response(200, {'message_id': message_id,'status': 'stored'})
+        except json.JSONDecodeError:
+            return response(400, {'error': 'Invalid JSON body'})
+        except Exception as e:
+            print(f"Error marking message as relevant: {str(e)}")
+            return response(500, {'error': str(e)})
+    return response(405, {'error': 'Method not allowed'})
+
+def handle_relevant_messages(event, method):
+    if method == 'GET':
+        try:
+            params = event.get('queryStringParameters') or {}
+            requested_session_id = params.get('session_id')
+            session_id = requested_session_id
+
+            active_table = dynamodb.Table(ACTIVE_SESSIONS_TABLE)
+            active_rows = active_table.scan().get('Items', [])
+            active_rows = [r for r in active_rows if r.get('Status') == 'ACTIVE']
+            if active_rows:
+                latest = max(active_rows, key=lambda r: int(r.get('UpdatedAt', 0) or 0))
+                active_session_id = latest.get('SessionId')
+                if active_session_id:
+                    session_id = active_session_id
+                    if requested_session_id and requested_session_id != active_session_id:
+                        print(f"[RELEVANT] Overriding requested session {requested_session_id} with active session {active_session_id}")
+                    elif not requested_session_id:
+                        print(f"[RELEVANT] session_id not provided; using active session {active_session_id}")
+            elif not session_id:
+                return response(200, [])
+            messages = get_relevant_messages(session_id)
+            return response(200, messages)
+        except Exception as e:
+            print(f"Error getting relevant messages: {str(e)}")
+            return response(500, {'error': str(e)})
+    return response(405, {'error': 'Method not allowed'})
+
+def list_s3_files(prefix):
+    """List all files under an S3 prefix"""
+    files = []
+    try:
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                files.append(obj['Key'])
+    except Exception as e:
+        print(f"Error listing S3 files for {prefix}: {e}")
+    return files
+
+
+def get_opensearch_total_count(session_id):
+    """
+    Get total transcription count from OpenSearch for a session.
+    Returns just the total count (not per-driver) for efficiency.
+    Use S3 transcription folder for per-driver counts.
+    """
+    try:
+        payload = {
+            "query": {
+                "bool": {"should": [
+                    {"term": {"SessionId": session_id}},
+                    {"term": {"SessionId.keyword": session_id}}
+                ], "minimum_should_match": 1}
+            }
+        }
+
+        credentials = base64.b64encode(f"{OPENSEARCH_USERNAME}:{OPENSEARCH_PASSWORD}".encode()).decode()
+        url = f"{OPENSEARCH_URL}/{OPENSEARCH_INDEX}/_count"
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {credentials}"
+            },
+            method="POST"
+        )
+
+        res = urllib.request.urlopen(req)
+        data = json.loads(res.read().decode())
+
+        total_count = data.get('count', 0)
+        print(f"OpenSearch total count for session {session_id}: {total_count}")
+
+        return total_count
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ''
+        print(f"OpenSearch HTTP error: {e.code} - {e.reason}")
+        print(f"Error body: {error_body}")
+        return 0
+    except Exception as e:
+        print(f"Error getting OpenSearch count: {e}")
+        return 0
+
+
+def get_dynamodb_total_count(session_id):
+    """
+    Get total transcription count from DynamoDB for a session.
+    Uses Query with SessionId partition key for efficiency.
+    """
+    try:
+        transcriptions_table = dynamodb.Table(TEXTHASH_TABLE)
+
+        response = transcriptions_table.query(
+            KeyConditionExpression=Key('SessionId').eq(session_id),
+            Select='COUNT'
+        )
+
+        total_count = response.get('Count', 0)
+
+        while 'LastEvaluatedKey' in response:
+            response = transcriptions_table.query(
+                KeyConditionExpression=Key('SessionId').eq(session_id),
+                Select='COUNT',
+                ExclusiveStartKey=response['LastEvaluatedKey']
+            )
+            total_count += response.get('Count', 0)
+
+        print(f"DynamoDB total count for session {session_id}: {total_count}")
+        return total_count
+
+    except Exception as e:
+        print(f"Error getting DynamoDB count: {e}")
+        return 0
+
+
+def handle_list_recordings(event, method):
+    """List all recordings/sessions with their files"""
+    if method != 'GET':
+        return response(405, {'error': 'Method not allowed'})
+
+    try:
+        result = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET,
+            Prefix=RAW_CHUNKS_PREFIX,
+            Delimiter='/'
+        )
+
+        sessions = []
+        for prefix in result.get('CommonPrefixes', []):
+            session_path = prefix['Prefix']
+            session_id = session_path.replace(RAW_CHUNKS_PREFIX, '').rstrip('/')
+            sessions.append({
+                'session_id': session_id,
+                'path': session_path
+            })
+
+        return response(200, {'sessions': sessions})
+
+    except Exception as e:
+        print(f"Error listing recordings: {str(e)}")
+        return response(500, {'error': str(e)})
+
+
+
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "https://search-andretti-fe-dev-to-indexing-tpuwdbzpfw6jz5g4z5rou2ab5q.aos.us-west-2.on.aws")
+OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "v2_transcriptions")
+def _get_opensearch_credentials():
+    client = boto3.client("secretsmanager", region_name="us-west-2")
+    response = client.get_secret_value(SecretId="andretti/opensearch-credentials")
+    return json.loads(response["SecretString"])
+
+_creds = _get_opensearch_credentials()
+OPENSEARCH_USERNAME = _creds["username"]
+OPENSEARCH_PASSWORD = _creds["password"]
+
+
+def handle_transcriptions(event, method):
+    """
+    Get transcriptions for a session from OpenSearch
+
+    Query Parameters:
+    - session_id (required): The session ID to get transcriptions for
+    - driver_id (optional): Filter by driver ID
+    - search (optional): Search text in messages
+    - limit (optional): Max results (default 1000)
+
+    Example:
+    GET /transcriptions?session_id=2025-01-01_practice
+    GET /transcriptions?session_id=2025-01-01_practice&driver_id=driver01
+    GET /transcriptions?session_id=2025-01-01_practice&search=box
+    """
+    if method != 'GET':
+        return response(405, {'error': 'Method not allowed'})
+
+    try:
+        params = event.get('queryStringParameters') or {}
+        session_id = params.get('session_id')
+        driver_id = params.get('driver_id')
+        search_text = params.get('search')
+        # DEFAULT WAS 1000, which silently truncated long sessions: a 30-minute
+        # race across 8 drivers produces ~1360 messages, so the API returned
+        # `total: 1360, count: 1000` and the UI simply stopped ~7 minutes early.
+        # 10000 is OpenSearch's own default max_result_window ceiling.
+        limit = int(params.get('limit', 10000))
+        limit = max(1, min(limit, 10000))
+
+        if not session_id:
+            return response(400, {'error': 'session_id is required'})
+        # Match the id whether SessionId/DriverId is mapped as keyword or as
+        # text-with-a-.keyword-subfield (dynamic mapping). A plain term on a
+        # text field returns nothing, so we OR both the field and its .keyword.
+        must_clauses = [
+            {"bool": {"should": [
+                {"term": {"SessionId": session_id}},
+                {"term": {"SessionId.keyword": session_id}}
+            ], "minimum_should_match": 1}}
+        ]
+
+        if driver_id:
+            must_clauses.append({"bool": {"should": [
+                {"term": {"DriverId": driver_id}},
+                {"term": {"DriverId.keyword": driver_id}}
+            ], "minimum_should_match": 1}})
+
+        if search_text:
+            must_clauses.append({"match": {"Message": search_text}})
+
+        payload = {
+            "query": {
+                "bool": {
+                    "must": must_clauses
+                }
+            },
+            "size": limit,
+            "sort": [{"Timestamp": {"order": "asc"}}]
+        }
+
+        print(f"OpenSearch query: {json.dumps(payload)}")
+
+        credentials = base64.b64encode(f"{OPENSEARCH_USERNAME}:{OPENSEARCH_PASSWORD}".encode()).decode()
+        url = f"{OPENSEARCH_URL}/{OPENSEARCH_INDEX}/_search"
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {credentials}"
+            },
+            method="POST"
+        )
+
+        res = urllib.request.urlopen(req)
+        data = json.loads(res.read().decode())
+        hits = data.get("hits", {}).get("hits", [])
+        total = data.get("hits", {}).get("total", {}).get("value", len(hits))
+
+        print(f"OpenSearch returned {len(hits)} hits (total: {total})")
+        if total > len(hits):
+            print(f"[TRANSCRIPTIONS] TRUNCATED - {total - len(hits)} messages NOT returned "
+                  f"(limit={limit}). The UI will be missing the end of this session.")
+
+        prerace_buffer = 0
+        started_at = 0
+        race_start_ts = 0
+        try:
+            from datetime import datetime as _dt
+            session_config_table = dynamodb.Table(os.environ.get('SESSION_TABLE', 'v2_SessionConfig'))
+            session_item = session_config_table.get_item(
+                Key={'session_id': session_id},
+                ConsistentRead=True
+            ).get('Item') or {}
+            if session_item.get('started_at'):
+                started_at = int(session_item['started_at'])
+            if session_item.get('start_time'):
+                race_start_ts = int(
+                    _dt.fromisoformat(
+                        str(session_item['start_time']).replace('Z', '+00:00')
+                    ).timestamp()
+                )
+        except Exception as e:
+            print(f"[TRANSCRIPTIONS] SessionConfig lookup failed ({e}); trying ActiveSessions")
+
+        if not started_at or not race_start_ts:
+            try:
+                active_sessions_table = dynamodb.Table(os.environ.get('ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions'))
+                active_item = active_sessions_table.get_item(
+                    Key={'SessionId': session_id},
+                    ConsistentRead=True
+                ).get('Item') or {}
+                if not started_at:
+                    started_at = int(active_item.get('StartedAt', 0) or 0)
+                if not race_start_ts:
+                    race_start_ts = int(active_item.get('RaceStartAt', 0) or 0)
+            except Exception as e:
+                print(f"[TRANSCRIPTIONS] ActiveSessions lookup failed ({e})")
+
+        if started_at and race_start_ts:
+            prerace_buffer = race_start_ts - started_at
+        print(f"[TRANSCRIPTIONS] session_id={session_id}, started_at={started_at}, race_start_ts={race_start_ts}, prerace_buffer={prerace_buffer}")
+
+        def format_race_relative(stored_session_time):
+            """Convert stored MM:SS / HH:MM:SS (seconds since ECS start) to race-relative
+            [-]MM:SS or [-]HH:MM:SS. Returns '00:00' when input is missing/unparseable."""
+            if not stored_session_time:
+                return "00:00"
+            try:
+                parts = list(map(int, str(stored_session_time).split(":")))
+            except (ValueError, AttributeError):
+                return str(stored_session_time)
+            if len(parts) == 2:
+                raw_seconds = parts[0] * 60 + parts[1]
+            elif len(parts) == 3:
+                raw_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else:
+                return str(stored_session_time)
+            delta = raw_seconds - prerace_buffer
+            sign = "-" if delta < 0 else ""
+            abs_delta = abs(delta)
+            hours = abs_delta // 3600
+            minutes = (abs_delta % 3600) // 60
+            seconds = abs_delta % 60
+            if hours > 0:
+                return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+            return f"{sign}{minutes:02d}:{seconds:02d}"
+
+        transcriptions = []
+        for hit in hits:
+            src = hit.get("_source", {})
+
+
+            audio_url = None
+            audio_s3_path = src.get("AudioS3Path", "")
+            if audio_s3_path and audio_s3_path.startswith("s3://"):
+                try:
+                    s3_parts = audio_s3_path.replace("s3://", "").split("/", 1)
+                    if len(s3_parts) == 2:
+                        bucket = s3_parts[0]
+                        key = s3_parts[1]
+                        audio_url = s3_client.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": bucket, "Key": key},
+                            ExpiresIn=43200
+                        )
+                except Exception as e:
+                    print(f"Error generating presigned URL for {audio_s3_path}: {e}")
+                    audio_url = None
+
+            transcriptions.append({
+                "id": hit.get("_id"),
+                "session_id": src.get("SessionId"),
+                "driver_id": src.get("DriverId"),
+                "driver": src.get("Driver"),
+                "team": src.get("Team"),
+                "speaker": src.get("Speaker"),
+                "session_time": format_race_relative(src.get("SessionTime")),
+                "message": src.get("Message"),
+                "segments": src.get("Segments", []),
+                "confidence": src.get("OverallConfidence"),
+                "audio_url": audio_url,
+                "audio_s3_path": audio_s3_path,
+                "source_file": src.get("SourceFile"),
+                "timestamp": src.get("Timestamp")
+            })
+
+        return response(200, {
+            "session_id": session_id,
+            "total": total,
+            "count": len(transcriptions),
+            "transcriptions": transcriptions
+        })
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else str(e)
+        print(f"OpenSearch HTTP error: {e.code} - {error_body}")
+        return response(500, {'error': f'OpenSearch error: {e.code}'})
+    except Exception as e:
+        print(f"Error getting transcriptions: {str(e)}")
+        return response(500, {'error': str(e)})
+
+
+
+# The ingester writes one continuous recording per driver directly to
+# full-race-recordings/<session>/<DRIVER>/full_session.mp3
+# (was "full-sessions/" + "_full_audio.mp3", from the old merge-based design
+# that no longer runs - which is why this endpoint always returned 404).
+FULL_SESSIONS_PREFIX = "full-race-recordings/"
+UPLOAD_MERGED_AUDIO_PREFIX = os.environ.get("UPLOAD_MERGED_AUDIO_PREFIX", "merged-audio/")  # upload-flow full audio, written by v2_audio_merge_lambda when invoked with flow=upload
+FULL_AUDIO_FILENAME = "full_session.mp3"
+
+
+def handle_full_audio(event, method):
+    """
+    Handle full session audio requests
+
+    Endpoints:
+    1. GET /full-audio?session_id=xxx
+       - List all drivers with full audio available for a session
+
+    2. GET /full-audio?session_id=xxx&driver_id=yyy
+       - Get presigned download URL for a specific driver's full audio
+
+    3. POST /full-audio (with body: {"session_id": "xxx", "driver_ids": ["a", "b"]})
+       - Trigger audio merge for specific drivers (or all if driver_ids not provided)
+       - This invokes the audio_merge_lambda
+
+    Response for GET with driver_id:
+    {
+        "session_id": "2025-01-01_practice",
+        "driver_id": "driver01",
+        "available": true,
+        "download_url": "https://...",
+        "expires_in": 43200
+    }
+
+    Response for GET without driver_id (list):
+    {
+        "session_id": "2025-01-01_practice",
+        "available_drivers": ["driver01", "driver02", ...],
+        "total": 5
+    }
+    """
+
+    if method == 'GET':
+        return handle_get_full_audio(event)
+    elif method == 'POST':
+        return handle_trigger_merge(event)
+    else:
+        return response(405, {'error': 'Method not allowed. Use GET to download or POST to trigger merge.'})
+
+
+def handle_get_full_audio(event):
+    """Handle GET requests for full audio download/listing"""
+    params = event.get('queryStringParameters') or {}
+    session_id = params.get('session_id')
+    driver_id = params.get('driver_id')
+
+    if not session_id:
+        return response(400, {'error': 'session_id is required'})
+
+    if driver_id:
+        return get_full_audio_download_url(session_id, driver_id)
+    else:
+        return list_available_full_audios(session_id)
+
+
+def get_full_audio_download_url(session_id, driver_id):
+    """Generate presigned URL for downloading full session audio.
+
+    Live flow: fixed path/filename, checked first - UNCHANGED behavior for
+    every existing live session.
+
+    Upload flow: v2_audio_merge_lambda writes uploads' merged audio under
+    UPLOAD_MERGED_AUDIO_PREFIX instead (see check_stale_upload_sessions in
+    v2_session_scheduler_lambda, which passes "flow": "upload"). That folder
+    has more than one filename pattern already in real use
+    ({driver}_merged.mp3 from older data, {session}_{driver}_full_audio.mp3
+    from newer runs), so rather than guess one convention, this lists the
+    folder and takes whatever .mp3 is there. This fallback only runs when
+    the live path has nothing - it never changes what live sessions see.
+    """
+    output_key = f"{FULL_SESSIONS_PREFIX}{session_id}/{driver_id}/{FULL_AUDIO_FILENAME}"
+    try:
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=output_key)
+            filename = f"{driver_id}_full_session.mp3"
+        except Exception:
+            upload_prefix = f"{UPLOAD_MERGED_AUDIO_PREFIX}{session_id}/{driver_id}/"
+            try:
+                listing = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=upload_prefix)
+                mp3_candidates = [
+                    obj for obj in listing.get('Contents', [])
+                    if obj['Key'].lower().endswith('.mp3')
+                ]
+            except Exception:
+                mp3_candidates = []
+
+            if not mp3_candidates:
+                return response(404, {
+                    "session_id": session_id,
+                    "driver_id": driver_id,
+                    "available": False,
+                    "error": "Full audio not available yet (session may still be running)."
+                })
+
+            output_key = mp3_candidates[0]['Key']
+            filename = os.path.basename(output_key)
+
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": output_key},
+            ExpiresIn=43200
+        )
+        return response(200, {
+            "session_id": session_id,
+            "driver_id": driver_id,
+            "available": True,
+            "download_url": url,
+            "filename": filename,
+            "expires_in": 43200,
+            "expires_in_hours": 12
+        })
+    except Exception as e:
+        print(f"Error getting full audio URL: {str(e)}")
+        return response(500, {'error': str(e)})
+
+def list_available_full_audios(session_id):
+    """List all drivers that have full audio available for a session"""
+    prefix = f"{FULL_SESSIONS_PREFIX}{session_id}/"
+
+    try:
+        response_data = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET,
+            Prefix=prefix,
+            Delimiter='/'
+        )
+
+        drivers = []
+        for prefix_info in response_data.get('CommonPrefixes', []):
+            driver_prefix = prefix_info['Prefix']
+            driver_id = driver_prefix.replace(prefix, '').rstrip('/')
+            if driver_id:
+                drivers.append(driver_id)
+
+        return response(200, {
+            "session_id": session_id,
+            "available_drivers": drivers,
+            "total": len(drivers)
+        })
+
+    except Exception as e:
+        print(f"Error listing full audios: {str(e)}")
+        return response(500, {'error': str(e)})
+
+
+def handle_trigger_merge(event):
+    """
+    Trigger audio merge for a session
+
+    Request body:
+    {
+        "session_id": "2025-01-01_practice",
+        "driver_ids": ["driver01", "driver02"]  // Optional - if not provided, merges all drivers
+    }
+    """
+    try:
+        body = json.loads(event.get('body', '{}'))
+        session_id = body.get('session_id')
+        driver_ids = body.get('driver_ids')
+
+        if not session_id:
+            return response(400, {'error': 'session_id is required'})
+
+        lambda_client = boto3.client('lambda')
+
+        payload = {
+            "session_id": session_id
+        }
+        if driver_ids:
+            payload["driver_ids"] = driver_ids
+
+        merge_lambda_name = os.environ.get('AUDIO_MERGE_LAMBDA', 'v2-audio-merge-lambda')
+
+        print(f"Invoking {merge_lambda_name} with payload: {json.dumps(payload)}")
+
+        lambda_client.invoke(
+            FunctionName=merge_lambda_name,
+            InvocationType='Event',
+            Payload=json.dumps(payload)
+        )
+
+        return response(202, {
+            "message": "Audio merge triggered successfully",
+            "session_id": session_id,
+            "driver_ids": driver_ids if driver_ids else "all",
+            "status": "processing",
+            "note": "Use GET /full-audio?session_id=xxx to check availability"
+        })
+
+    except json.JSONDecodeError:
+        return response(400, {'error': 'Invalid JSON body'})
+    except Exception as e:
+        print(f"Error triggering merge: {str(e)}")
+        return response(500, {'error': str(e)})
+
+
+

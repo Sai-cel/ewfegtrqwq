@@ -1,0 +1,2027 @@
+############ 16/07/2026 ############
+"""
+Session Scheduler Lambda
+Handles session CRUD operations and EventBridge scheduling for automatic ECS start/stop.
+
+API Routes:
+- POST   /sessions         - Create new session (schedules EventBridge rules)
+- GET    /sessions         - List all sessions
+- GET    /sessions/{id}    - Get session by ID
+- PUT    /sessions/{id}    - Update session
+- DELETE /sessions/{id}    - Delete session (removes EventBridge rules)
+- POST   /sessions/{id}/start - Manually start session (triggers ECS)
+- POST   /sessions/{id}/stop  - Manually stop session (stops ECS)
+
+Environment Variables:
+- SESSION_TABLE: DynamoDB table for session configs (default: v2_SessionConfig)
+- DRIVER_TABLE: DynamoDB table for driver configs (default: v2_DriverConfig)
+- ACTIVE_SESSIONS_TABLE: DynamoDB table for active sessions (default: v2_ActiveSessions)
+- ECS_CLUSTER: ECS cluster name
+- ECS_TASK_DEFINITION: ECS task definition name
+- ECS_SUBNETS: Comma-separated subnet IDs
+- ECS_SECURITY_GROUPS: Comma-separated security group IDs
+- SCHEDULER_LAMBDA_ARN: ARN of this Lambda (for EventBridge targets)
+
+Driver Config Schema:
+{
+    "driver_id": "driver01",
+    "driver_name": "Colton Herta",
+    "driver_number": "26",
+    "team": "Andretti Global",
+    "stream_url": "http://stream.example.com/driver01/stream.m3u8",  # M3U8 stream URL
+    "driver_address": "192.168.1.100:8080",  # Driver device/radio address
+    "is_active": true
+}
+"""
+
+from datetime import datetime, timezone
+from datetime import timezone
+from datetime import datetime, timezone, timedelta
+import json
+import time
+import boto3
+import os
+import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
+try:
+    from zoneinfo import ZoneInfo, available_timezones
+except ImportError:  # Python < 3.9 or missing tzdata
+    ZoneInfo = None
+    available_timezones = None
+
+dynamodb = boto3.resource('dynamodb')
+events_client = boto3.client('events')
+ecs_client = boto3.client('ecs')
+lambda_client = boto3.client('lambda')
+s3_client = boto3.client('s3')
+
+CONNECTIONS_TABLE = os.environ.get('CONNECTIONS_TABLE', 'v2_websocket-connections')
+WEBSOCKET_ENDPOINT = os.environ.get('WEBSOCKET_ENDPOINT', '')
+
+
+def broadcast_to_websocket_clients(payload):
+    """Push a message to every active WebSocket dashboard client so the UI can
+    refresh in response to session state changes.
+
+    Used for:
+      - session_scheduled  -> a new session was just created; refresh immediately
+      - session_started    -> auto or manual start; refresh to show live data
+      - session_stopped    -> session ended; refresh after grace_period_seconds
+
+    No-op if WEBSOCKET_ENDPOINT env var is not configured."""
+    try:
+        conn_table = dynamodb.Table(CONNECTIONS_TABLE)
+        connections = conn_table.scan().get('Items', [])
+    except Exception as e:
+        print(f"[WS_BROADCAST] Could not list connections: {e}")
+        return
+    if not connections:
+        print(f"[WS_BROADCAST] No active connections; skipping {payload.get('message_type')}")
+        return
+
+    body = json.dumps(payload).encode('utf-8')
+    sent = 0
+    clients_by_endpoint = {}
+    for conn in connections:
+        cid = conn.get('connectionId')
+        if not cid:
+            continue
+        endpoint = WEBSOCKET_ENDPOINT
+        if not endpoint:
+            dn = conn.get('domainName')
+            st = conn.get('stage')
+            if dn and st:
+                endpoint = f"https://{dn}/{st}"
+            else:
+                print(f"[WS_BROADCAST] Missing endpoint metadata for {cid}; skipping")
+                continue
+        apigw = clients_by_endpoint.get(endpoint)
+        if apigw is None:
+            try:
+                apigw = boto3.client('apigatewaymanagementapi', endpoint_url=endpoint)
+                clients_by_endpoint[endpoint] = apigw
+            except Exception as e:
+                print(f"[WS_BROADCAST] Could not create apigateway client for {endpoint}: {e}")
+                continue
+        try:
+            apigw.post_to_connection(ConnectionId=cid, Data=body)
+            sent += 1
+        except Exception as e:
+            err_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+            if err_code in ('GoneException', 'ForbiddenException', 'BadRequestException'):
+                try:
+                    conn_table.delete_item(Key={'connectionId': cid})
+                except Exception:
+                    pass
+            else:
+                print(f"[WS_BROADCAST] post failed for {cid}: {e}")
+    print(f"[WS_BROADCAST] {payload.get('message_type')} pushed to {sent}/{len(connections)} clients")
+
+
+def grant_eventbridge_invoke_permission(rule_name):
+    """Grant the EventBridge rule permission to invoke this Lambda.
+
+    Without this, put_rule + put_targets succeed but the scheduled event
+    never actually fires the Lambda — sessions silently fail to auto-start
+    at their start_time. ResourceConflictException means the permission
+    already exists (e.g. the rule was recreated), which is fine."""
+    if not SCHEDULER_LAMBDA_ARN:
+        print(f"[PERMISSION] SCHEDULER_LAMBDA_ARN not set; cannot grant invoke for rule '{rule_name}'")
+        return
+    try:
+        rule_arn = events_client.describe_rule(Name=rule_name)['Arn']
+    except Exception as e:
+        print(f"[PERMISSION] Could not describe rule '{rule_name}' to get ARN: {e}")
+        return
+    try:
+        lambda_client.add_permission(
+            FunctionName=SCHEDULER_LAMBDA_ARN,
+            StatementId=f'eb-{rule_name}'[:100],
+            Action='lambda:InvokeFunction',
+            Principal='events.amazonaws.com',
+            SourceArn=rule_arn
+        )
+        print(f"[PERMISSION] Granted EventBridge invoke for rule '{rule_name}'")
+    except lambda_client.exceptions.ResourceConflictException:
+        print(f"[PERMISSION] Invoke permission already exists for rule '{rule_name}'")
+    except Exception as e:
+        print(f"[PERMISSION] Failed to add permission for rule '{rule_name}': {e}")
+
+SESSION_TABLE = os.environ.get('SESSION_TABLE', 'v2_SessionConfig')
+DRIVER_TABLE = os.environ.get('DRIVER_TABLE', 'v2_DriverConfig')
+ACTIVE_SESSIONS_TABLE = os.environ.get(
+    'ACTIVE_SESSIONS_TABLE', 'v2_ActiveSessions')
+ECS_CLUSTER = os.environ.get(
+    'ECS_CLUSTER',
+    'andretti-fe-dev-container-audio-chunks-computation')
+ECS_TASK_DEFINITION = os.environ.get('ECS_TASK_DEFINITION', 'v2_req_ingester')
+ECS_SUBNETS = [s for s in os.environ.get('ECS_SUBNETS', '').split(',') if s]
+ECS_SECURITY_GROUPS = os.environ.get('ECS_SECURITY_GROUPS', '').split(',')
+ECS_CONTAINER_NAME = os.environ.get('ECS_CONTAINER_NAME', 'v2_req_ingester')
+SCHEDULER_LAMBDA_ARN = os.environ.get('SCHEDULER_LAMBDA_ARN', '')
+
+session_table = dynamodb.Table(SESSION_TABLE)
+driver_table = dynamodb.Table(DRIVER_TABLE)
+active_sessions_table = dynamodb.Table(ACTIVE_SESSIONS_TABLE)
+
+# Audit trail + environment configuration.
+AUDIT_S3_BUCKET = os.environ.get('AUDIT_S3_BUCKET', 'test-v2-andretti-audit-logs')
+AUDIT_S3_PREFIX = os.environ.get('AUDIT_S3_PREFIX', 'audit-logs/')
+SESSION_LOGS_PREFIX = os.environ.get('SESSION_LOGS_PREFIX', 'session_logs/')
+SYSTEM_LOGS_PREFIX = os.environ.get('SYSTEM_LOGS_PREFIX', 'system_logs/')
+SESSION_SCOPED_ENTITIES = {'pipeline', 'session', 'session_config', 'recording'}
+ENVIRONMENT = os.environ.get('ENV', os.environ.get('STAGE', 'development')).lower()
+IS_PRODUCTION = ENVIRONMENT in ('prod', 'production')
+
+
+def get_created_by(data):
+    """Resolve the acting login user from the request body.
+
+    The frontend sends `created_by` (the logged-in user's username/email).
+    Falls back to 'unknown' so a missing field never blocks the request."""
+    if isinstance(data, dict):
+        actor = data.get('created_by') or data.get('username')
+        if actor:
+            return str(actor).strip()
+    return 'unknown'
+
+
+def actor_from_event(event):
+    """Best-effort extraction of the acting user for requests that may not pass
+    a parsed body (DELETE/start/stop). Checks body then query string."""
+    body = event.get('body')
+    if body:
+        try:
+            data = json.loads(body) if isinstance(body, str) else body
+            if isinstance(data, dict) and (data.get('created_by') or data.get('username')):
+                return get_created_by(data)
+        except Exception:
+            pass
+    qs = event.get('queryStringParameters') or {}
+    return qs.get('created_by') or 'unknown'
+
+
+# Audit trail — every session lifecycle event is written to AUDIT_S3_BUCKET
+# (test-v2-andretti-audit-logs) so the full system flow is logged end to end.
+def record_audit_event(action, entity, entity_id, created_by, details=None):
+    """Write an audit-trail record to S3 in three places:
+      * {prefix}YYYY/MM/DD/{action}_{epoch}_{id}.json  - date partition
+        (original layout, unchanged; this app's own /audit-logs endpoint
+        reads from here).
+      * session_logs/{session_id}/{action}_{epoch}_{id}.json  - for
+        session-scoped events (entity in SESSION_SCOPED_ENTITIES; this
+        Lambda's SESSION_* events all qualify), so "every event for session
+        X" is one S3 ListObjectsV2 prefix call.
+      * system_logs/YYYY/MM/DD/{action}_{epoch}_{id}.json  - for everything
+        else.
+
+    No-op if AUDIT_S3_BUCKET is not configured. Never raises — audit logging
+    must not break the primary request flow."""
+    if not AUDIT_S3_BUCKET:
+        return
+    try:
+        now = datetime.utcnow()
+        record = {
+            'audit_id': str(uuid.uuid4()),
+            'timestamp': now.isoformat() + 'Z',
+            'action': action,
+            'entity': entity,
+            'entity_id': str(entity_id) if entity_id is not None else '',
+            'created_by': created_by or 'unknown',
+            'details': details or {}
+        }
+        suffix = f"{action}_{int(now.timestamp())}_{record['audit_id'][:8]}.json"
+        body = json.dumps(record, default=str).encode('utf-8')
+        date_path = now.strftime('%Y/%m/%d')
+        s3_client.put_object(
+            Bucket=AUDIT_S3_BUCKET,
+            Key=f"{AUDIT_S3_PREFIX}{date_path}/{suffix}",
+            Body=body,
+            ContentType='application/json'
+        )
+        if entity in SESSION_SCOPED_ENTITIES and record['entity_id']:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SESSION_LOGS_PREFIX}{record['entity_id']}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+        else:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SYSTEM_LOGS_PREFIX}{date_path}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+    except Exception as e:
+        print(f"[AUDIT] Failed to record {action} for {entity}:{entity_id}: {e}")
+
+
+def _build_utc_offsets():
+    """Standard UTC offsets from -12:00 to +14:00 (including the half/quarter-hour
+    zones) for the create-session dropdown."""
+    raw = [
+        (-12, 0), (-11, 0), (-10, 0), (-9, 30), (-9, 0), (-8, 0), (-7, 0),
+        (-6, 0), (-5, 0), (-4, 0), (-3, 30), (-3, 0), (-2, 0), (-1, 0),
+        (0, 0), (1, 0), (2, 0), (3, 0), (3, 30), (4, 0), (4, 30), (5, 0),
+        (5, 30), (5, 45), (6, 0), (6, 30), (7, 0), (8, 0), (8, 45), (9, 0),
+        (9, 30), (10, 0), (10, 30), (11, 0), (12, 0), (12, 45), (13, 0), (14, 0),
+    ]
+    out = []
+    for h, m in raw:
+        sign = '+' if h >= 0 else '-'
+        value = f"UTC{sign}{abs(h):02d}:{m:02d}"
+        offset_minutes = h * 60 + (m if h >= 0 else -m)
+        out.append({'label': f"({value})", 'value': value,
+                    'offset_minutes': offset_minutes})
+    return out
+
+
+UTC_OFFSETS = _build_utc_offsets()
+
+
+def _parse_utc_offset(tz_name):
+    """Convert a fixed UTC-offset string into a tzinfo.
+
+    Accepts 'UTC+05:30', 'GMT-08:00', '+05:30', '-0800', 'UTC', 'UTC+00:00'.
+    Returns a datetime.timezone, or None if the string isn't offset-style
+    (e.g. an IANA name like 'America/New_York')."""
+    if tz_name is None:
+        return None
+    s = str(tz_name).strip().upper()
+    for prefix in ('UTC', 'GMT'):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+            break
+    if s == '':
+        return timezone.utc
+    sign = 1
+    if s[0] in '+-':
+        sign = -1 if s[0] == '-' else 1
+        s = s[1:]
+    if ':' in s:
+        hh, mm = s.split(':', 1)
+    elif len(s) > 2:
+        hh, mm = s[:-2], s[-2:]
+    else:
+        hh, mm = s, '0'
+    try:
+        hours, minutes = int(hh), int(mm)
+    except ValueError:
+        return None
+    if hours > 14 or minutes >= 60:
+        return None
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def parse_session_datetime(dt_str, tz_name=None):
+    """Parse an ISO datetime string into a timezone-aware datetime.
+
+    Resolution order:
+      1. If the string already carries an offset ('...Z' or '+05:30'), that wins.
+      2. Else if tz_name is a UTC offset ('UTC+05:30'), apply that fixed offset.
+      3. Else if tz_name is an IANA name and zoneinfo is available, use it.
+      4. Else treat the time as UTC.
+
+    The result is tz-aware, so datetime_to_cron() converts it to UTC correctly
+    for EventBridge regardless of the chosen offset."""
+    dt = datetime.fromisoformat(str(dt_str).strip().replace('Z', '+00:00'))
+    if dt.tzinfo is not None:
+        return dt
+    if tz_name:
+        offset_tz = _parse_utc_offset(tz_name)
+        if offset_tz is not None:
+            return dt.replace(tzinfo=offset_tz)
+        if ZoneInfo is not None:
+            try:
+                return dt.replace(tzinfo=ZoneInfo(tz_name))
+            except Exception as e:
+                print(f"[TZ] Unknown timezone '{tz_name}' ({e}); treating time as UTC")
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _format_offset(minutes):
+    """Format signed offset minutes as a UTC label, e.g. 330 -> 'UTC+05:30'."""
+    sign = '+' if minutes >= 0 else '-'
+    a = abs(int(minutes))
+    return f"UTC{sign}{a // 60:02d}:{a % 60:02d}"
+
+
+def list_timezones():
+    """Return ALL IANA timezones for the create-session dropdown, each labelled
+    with its current UTC offset, sorted by offset then name, e.g.
+    {'value': 'Asia/Kolkata', 'label': '(UTC+05:30) Asia/Kolkata',
+     'offset_minutes': 330}.
+
+    UTC is always included. Falls back to fixed UTC offsets if the runtime has
+    no IANA tz database (add the 'tzdata' package to the deployment to avoid the
+    fallback on Amazon Linux 2023 / python3.12+)."""
+    if ZoneInfo is not None and available_timezones is not None:
+        try:
+            now = datetime.now(timezone.utc)
+            zones = []
+            for name in available_timezones():
+                try:
+                    off = now.astimezone(ZoneInfo(name)).utcoffset()
+                    mins = int(off.total_seconds() // 60) if off else 0
+                except Exception:
+                    continue
+                zones.append({
+                    'value': name,
+                    'label': f"({_format_offset(mins)}) {name}",
+                    'offset_minutes': mins,
+                })
+            if zones:
+                if not any(z['value'] == 'UTC' for z in zones):
+                    zones.append({'value': 'UTC', 'label': '(UTC+00:00) UTC',
+                                  'offset_minutes': 0})
+                zones.sort(key=lambda z: (z['offset_minutes'], z['value']))
+                return response(200, {'timezones': zones, 'count': len(zones)})
+        except Exception as e:
+            print(f"[TZ] Failed to build IANA list ({e}); falling back to UTC offsets")
+    return response(200, {'timezones': UTC_OFFSETS, 'count': len(UTC_OFFSETS)})
+
+
+def derive_race_name(session_name):
+    """Race name defaults to the first word of the session name
+    (e.g. 'Monaco GP Practice' -> 'Monaco'). Returns '' if empty."""
+    if not session_name:
+        return ''
+    parts = str(session_name).strip().split()
+    return parts[0] if parts else str(session_name).strip()
+
+
+def add_schedule_columns(session):
+    """Ensure a session dict carries the two race-schedule display columns:
+    `race_name` (first word of session_name by default) and `created_date`
+    (YYYY-MM-DD from created_at). Derived on read so existing rows that predate
+    these fields still populate the columns. Does not overwrite stored values."""
+    if not session.get('race_name'):
+        session['race_name'] = derive_race_name(session.get('session_name', ''))
+    if not session.get('created_date'):
+        created_at = session.get('created_at') or ''
+        session['created_date'] = created_at[:10] if created_at else ''
+    if not session.get('timezone'):
+        session['timezone'] = 'UTC' 
+    return session
+
+
+class DecimalEncoder(json.JSONEncoder):
+    """Handle Decimal types from DynamoDB."""
+
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super(DecimalEncoder, self).default(obj)
+
+
+def lambda_handler(event, context):
+    """Main Lambda handler."""
+    print(f"Event: {json.dumps(event)}")
+
+    if event.get('source') == 'aws.events':
+        return handle_scheduled_event(event)
+
+    http_method = event.get(
+        'httpMethod',
+        event.get(
+            'requestContext',
+            {}).get(
+            'http',
+            {}).get(
+                'method',
+            ''))
+    path = event.get('path', event.get('rawPath', ''))
+    path_parameters = event.get('pathParameters') or {}
+
+    print(f"Method: {http_method}, Path: {path}")
+
+    try:
+        if '/timezones' in path:
+            if http_method == 'GET':
+                return list_timezones()
+            return response(405, {'error': 'Method not allowed'})
+
+        if '/sessions' in path:
+            session_id = path_parameters.get(
+                'session_id') or path_parameters.get('proxy', '').split('/')[-1]
+
+            actor = actor_from_event(event)
+
+            if path.endswith('/start') and http_method == 'POST':
+                return start_session_manually(session_id.replace('/start', ''), actor)
+            elif path.endswith('/stop') and http_method == 'POST':
+                return stop_session_manually(session_id.replace('/stop', ''), actor)
+            elif session_id and session_id != 'sessions':
+                if http_method == 'GET':
+                    return get_session(session_id)
+                elif http_method == 'PUT':
+                    return update_session(
+                        session_id, json.loads(
+                            event.get(
+                                'body', '{}')))
+                elif http_method == 'DELETE':
+                    return delete_session(session_id, actor)
+            else:
+                if http_method == 'GET':
+                    status_filter = (event.get('queryStringParameters') or {}).get('status')
+                    return list_sessions(status_filter)
+                elif http_method == 'POST':
+                    return create_session(json.loads(event.get('body', '{}')))
+
+        return response(400, {'error': 'Invalid request path'})
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return response(500, {'error': str(e)})
+
+
+def handle_scheduled_event(event):
+    """Handle EventBridge scheduled events for starting/stopping ECS,
+    and the recurring stale-upload-session check."""
+    detail = event.get('detail', {})
+    action = detail.get('action')
+    session_id = detail.get('session_id')
+
+    print(f"Scheduled event - Action: {action}, Session: {session_id}")
+
+    if action == 'START':
+        return start_ecs_task(session_id, actor='scheduler')
+    elif action == 'STOP':
+        return stop_ecs_task(session_id, actor='scheduler')
+    elif action == 'CHECK_STALE_UPLOADS':
+        return check_stale_upload_sessions()
+    else:
+        print(f"Unknown action: {action}")
+        return {'statusCode': 400, 'body': 'Unknown action'}
+
+
+# --- Upload-flow completion detection ---
+# Uploaded sessions have no v2_ActiveSessions entry (that table is only
+# written by the live-flow ECS task), so we never get a "session stopped"
+# signal for them the way live sessions do. Instead, this runs on a
+# recurring EventBridge schedule (every 5 minutes) and treats an upload
+# session as finished once its audit trail (session_logs/{session_id}/ in
+# the audit S3 bucket - the same log stream every pipeline Lambda already
+# writes to) has been quiet for STALE_UPLOAD_THRESHOLD_MINUTES. This mirrors
+# exactly what stop_ecs_task() already does for live sessions: mark the
+# session COMPLETED and invoke the audio-merge Lambda - just triggered by
+# inactivity instead of an explicit stop signal.
+STALE_UPLOAD_THRESHOLD_MINUTES = int(os.environ.get('STALE_UPLOAD_THRESHOLD_MINUTES', '5'))
+
+
+def _get_last_session_activity(session_id):
+    """Most recent audit-log timestamp for this session, or None if no
+    logs exist yet (e.g. session just created, nothing processed)."""
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=AUDIT_S3_BUCKET,
+            Prefix=f"{SESSION_LOGS_PREFIX}{session_id}/"
+        )
+        contents = resp.get('Contents', [])
+        if not contents:
+            return None
+        return max(obj['LastModified'] for obj in contents)
+    except Exception as e:
+        print(f"[STALE_CHECK] Error reading session logs for {session_id}: {e}")
+        return None
+
+
+def check_stale_upload_sessions():
+    """Scan v2_SessionConfig for upload-flow sessions (no v2_ActiveSessions
+    entry) that are not yet COMPLETED, and finish any whose audit trail has
+    gone quiet for STALE_UPLOAD_THRESHOLD_MINUTES."""
+    from datetime import datetime as _dt, timezone as _tz
+
+    print(f"[STALE_CHECK] Starting stale-upload-session scan (threshold={STALE_UPLOAD_THRESHOLD_MINUTES}m)")
+    checked = 0
+    completed = []
+    errors = []
+
+    try:
+        scan_kwargs = {}
+        while True:
+            resp = session_table.scan(**scan_kwargs)
+            for session in resp.get('Items', []):
+                session_id = session.get('session_id')
+                status = (session.get('status') or '').upper()
+                if not session_id or status == 'COMPLETED':
+                    continue
+
+                # A session belongs to the live flow if and only if it was
+                # created through the scheduler, which always sets these two
+                # EventBridge rule fields (see create_session). Uploads never
+                # go through that path, so they never have these fields -
+                # this is true whether the live race is scheduled, currently
+                # running, or already finished, unlike checking
+                # v2_ActiveSessions, which is only populated once the race's
+                # ECS task actually starts and wrongly looked like "not live"
+                # for any race that was merely scheduled but not yet started.
+                if session.get('eventbridge_start_rule') or session.get('eventbridge_stop_rule'):
+                    continue
+
+                checked += 1
+                last_activity = _get_last_session_activity(session_id)
+                if last_activity is None:
+                    print(f"[STALE_CHECK] {session_id}: no session logs yet, skipping")
+                    continue
+
+                age_minutes = (_dt.now(_tz.utc) - last_activity).total_seconds() / 60.0
+                if age_minutes < STALE_UPLOAD_THRESHOLD_MINUTES:
+                    print(f"[STALE_CHECK] {session_id}: last activity {age_minutes:.1f}m ago, still recent")
+                    continue
+
+                print(f"[STALE_CHECK] {session_id}: quiet for {age_minutes:.1f}m, marking COMPLETED and triggering merge")
+                try:
+                    session_table.update_item(
+                        Key={'session_id': session_id},
+                        UpdateExpression="SET #status = :status, #updated_at = :updated_at",
+                        ExpressionAttributeNames={'#status': 'status', '#updated_at': 'updated_at'},
+                        ExpressionAttributeValues={
+                            ':status': 'COMPLETED',
+                            ':updated_at': datetime.utcnow().isoformat() + 'Z'
+                        }
+                    )
+                    audio_merge_lambda = os.environ.get('AUDIO_MERGE_LAMBDA', 'v2_audio_merge_lambda')
+                    lambda_client = boto3.client('lambda')
+                    lambda_client.invoke(
+                        FunctionName=audio_merge_lambda,
+                        InvocationType='Event',
+                        Payload=json.dumps({"session_id": session_id, "flow": "upload"})
+                    )
+                    record_audit_event('SESSION_STOP', 'session', session_id, 'system', {
+                        'note': 'upload session completed via stale-activity detection',
+                        'quiet_minutes': round(age_minutes, 1)
+                    })
+                    completed.append(session_id)
+                except Exception as e:
+                    print(f"[STALE_CHECK] Error completing {session_id}: {e}")
+                    errors.append({'session_id': session_id, 'error': str(e)})
+
+            if 'LastEvaluatedKey' in resp:
+                scan_kwargs['ExclusiveStartKey'] = resp['LastEvaluatedKey']
+            else:
+                break
+    except Exception as e:
+        print(f"[STALE_CHECK] Fatal error during scan: {e}")
+        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+    print(f"[STALE_CHECK] Done. checked={checked}, completed={completed}, errors={errors}")
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'checked': checked, 'completed': completed, 'errors': errors})
+    }
+
+
+def resolve_drivers(data):
+    """
+    Resolve drivers from any of the supported formats.
+    Returns (driver_snapshot, driver_ids) tuple or (None, error_response) on failure.
+
+    Supports:
+    - driver_ids: ["driver01", "driver02"] - lookup by driver_id (primary key)
+    - driver_numbers: ["26", "10"] - lookup by car number
+    - driver_names: ["Colton Herta", "Kyle Kirkwood"] - lookup by driver name
+    """
+    driver_snapshot = []
+
+    if data.get('driver_ids'):
+        driver_ids_input = data['driver_ids']
+        if not isinstance(driver_ids_input, list):
+            return None, response(400, {'error': 'driver_ids must be a list'})
+
+        for driver_id in driver_ids_input:
+            driver_response = driver_table.get_item(
+                Key={'driver_id': driver_id})
+            if 'Item' not in driver_response:
+                return None, response(
+                    400, {'error': f'Driver not found with id: {driver_id}'})
+            driver_snapshot.append(driver_response['Item'])
+
+    elif data.get('driver_numbers'):
+        driver_numbers = data['driver_numbers']
+        if not isinstance(driver_numbers, list):
+            return None, response(
+                400, {'error': 'driver_numbers must be a list'})
+
+        all_drivers = driver_table.scan().get('Items', [])
+        for num in driver_numbers:
+            num_str = str(num)
+            found = next(
+                (d for d in all_drivers if str(
+                    d.get(
+                        'driver_number',
+                        '')) == num_str),
+                None)
+            if not found:
+                return None, response(
+                    400, {'error': f'Driver not found with number: {num}'})
+            driver_snapshot.append(found)
+
+    elif data.get('driver_names'):
+        driver_names = data['driver_names']
+        if not isinstance(driver_names, list):
+            return None, response(
+                400, {'error': 'driver_names must be a list'})
+
+        all_drivers = driver_table.scan().get('Items', [])
+        for name in driver_names:
+            name_lower = name.lower()
+            found = next(
+                (d for d in all_drivers if d.get(
+                    'driver_name',
+                    '').lower() == name_lower),
+                None)
+            if not found:
+                return None, response(
+                    400, {'error': f'Driver not found with name: {name}'})
+            driver_snapshot.append(found)
+
+    else:
+        return None, None
+
+    if not driver_snapshot:
+        return None, response(400, {'error': 'No valid drivers found'})
+
+    # Test drivers are always allowed and visible in the drivers list (the
+    # show-test-drivers toggle has been removed).
+
+    driver_snapshot = [{
+        'driver_id': d.get('driver_id', ''),
+        'driver_name': d.get('driver_name', ''),
+        'driver_number': str(d.get('driver_number', '')),
+        'team': d.get('team', ''),
+        'stream_url': d.get('stream_url', ''),
+        'driver_address': d.get('driver_address', '')
+    } for d in driver_snapshot]
+
+    driver_ids = [d['driver_id'] for d in driver_snapshot]
+
+    return (driver_snapshot, driver_ids), None
+
+
+def create_session(data):
+    """Create a new session and schedule EventBridge rules.
+
+    Accepts drivers in any of these formats:
+    - driver_ids: ["driver01", "driver02"] - lookup by driver_id (primary key)
+    - driver_numbers: ["26", "10"] - lookup by car number
+    - driver_names: ["Colton Herta", "Kyle Kirkwood"] - lookup by driver name
+    """
+    if not data.get('session_name'):
+        return response(400, {'error': 'Please provide a session name.'})
+
+    if not data.get('start_time') or not data.get('end_time'):
+        return response(400, {'error': 'Please provide both start and end time.'})
+
+    has_drivers = data.get('driver_ids') or data.get(
+        'driver_numbers') or data.get('driver_names')
+    if not has_drivers:
+        return response(400, {'error': 'Please select at least one driver.'})
+
+    duplicate_name = find_session_name_conflict(data['session_name'])
+    if duplicate_name:
+        return response(400, {'error': 'A session with this name already exists.'})
+
+    if data.get('session_id'):
+        session_id = data['session_id']
+    else:
+        clean_name = data['session_name'].replace(' ', '_')
+        clean_name = ''.join(c for c in clean_name if c.isalnum() or c == '_')
+
+        try:
+            start_dt = datetime.fromisoformat(
+                data['start_time'].replace('Z', '+00:00'))
+            timestamp = start_dt.strftime("%Y-%m-%d_%H-%M")
+        except BaseException:
+            timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+
+        session_id = f"{clean_name}_{timestamp}"
+        print(f"Generated session_id: {session_id}")
+
+    resolved, error = resolve_drivers(data)
+    if error:
+        return error
+    if resolved is None:
+        return response(400, {'error': 'No valid drivers found'})
+
+    driver_snapshot, driver_ids = resolved
+    print(
+        f"Resolved {len(driver_snapshot)} drivers: {[d['driver_name'] for d in driver_snapshot]}")
+
+    session_timezone = data.get('timezone') or 'UTC'
+    try:
+        start_dt = parse_session_datetime(data['start_time'], session_timezone)
+        end_dt = parse_session_datetime(data['end_time'], session_timezone)
+    except ValueError as e:
+        return response(400, {'error': f'Invalid datetime format: {str(e)}'})
+
+    if end_dt <= start_dt:
+        return response(400, {'error': 'End time must be after start time.'})
+
+    overlap_name = find_overlapping_session_name(start_dt, end_dt)
+    if overlap_name:
+        return response(400, {
+            'error': f'Cannot create session. "{overlap_name}" is already scheduled during this time.'
+        })
+
+    start_rule_name = f"andretti-start-{session_id}"
+    stop_rule_name = f"andretti-stop-{session_id}"
+
+    try:
+        start_cron = datetime_to_cron(start_dt)
+        events_client.put_rule(
+            Name=start_rule_name,
+            ScheduleExpression=start_cron,
+            State='ENABLED',
+            Description=f'Start ECS for session: {session_id}'
+        )
+
+        events_client.put_targets(
+            Rule=start_rule_name,
+            Targets=[{
+                'Id': f'start-{session_id}',
+                'Arn': SCHEDULER_LAMBDA_ARN,
+                'Input': json.dumps({
+                    'source': 'aws.events',
+                    'detail': {
+                        'action': 'START',
+                        'session_id': session_id
+                    }
+                })
+            }]
+        )
+        grant_eventbridge_invoke_permission(start_rule_name)
+
+        stop_cron = datetime_to_cron(end_dt)
+        events_client.put_rule(
+            Name=stop_rule_name,
+            ScheduleExpression=stop_cron,
+            State='ENABLED',
+            Description=f'Stop ECS for session: {session_id}'
+        )
+
+        events_client.put_targets(
+            Rule=stop_rule_name,
+            Targets=[{
+                'Id': f'stop-{session_id}',
+                'Arn': SCHEDULER_LAMBDA_ARN,
+                'Input': json.dumps({
+                    'source': 'aws.events',
+                    'detail': {
+                        'action': 'STOP',
+                        'session_id': session_id
+                    }
+                })
+            }]
+        )
+        grant_eventbridge_invoke_permission(stop_rule_name)
+
+        print(
+            f"Created EventBridge rules: {start_rule_name}, {stop_rule_name}")
+
+    except Exception as e:
+        print(f"Error creating EventBridge rules: {str(e)}")
+        try:
+            events_client.remove_targets(
+                Rule=start_rule_name, Ids=[f'start-{session_id}'])
+            events_client.delete_rule(Name=start_rule_name)
+        except BaseException:
+            pass
+        try:
+            events_client.remove_targets(
+                Rule=stop_rule_name, Ids=[f'stop-{session_id}'])
+            events_client.delete_rule(Name=stop_rule_name)
+        except BaseException:
+            pass
+        return response(
+            500, {
+                'error': f'Failed to create EventBridge rules: {str(e)}'})
+
+    now = datetime.utcnow().isoformat() + 'Z'
+    created_by = get_created_by(data)
+    race_name = data.get('race_name') or derive_race_name(data['session_name'])
+    session_item = {
+        'session_id': session_id,
+        'session_name': data['session_name'],
+        'race_name': race_name,
+        'session_type': data.get('session_type', 'RACE'),
+        'timezone': session_timezone,
+        'start_time': data['start_time'],
+        'end_time': data['end_time'],
+        'driver_ids': driver_ids,
+        'driver_snapshot': driver_snapshot,
+        'status': 'SCHEDULED',
+        'eventbridge_start_rule': start_rule_name,
+        'eventbridge_stop_rule': stop_rule_name,
+        'created_by': created_by,
+        'created_at': now,
+        'created_date': now[:10],
+        'updated_at': now
+    }
+
+    session_table.put_item(Item=session_item)
+
+    record_audit_event('SESSION_CREATE', 'session', session_id, created_by, {
+        'session_name': data['session_name'],
+        'start_time': data['start_time'],
+        'end_time': data['end_time'],
+        'driver_ids': driver_ids
+    })
+
+    # If the newly created session is already within its active window
+    # (start_time passed but end_time not reached), start immediately so
+    # users don't have to refresh/wait for the next scheduler tick.
+    now_utc = datetime.now(timezone.utc)
+    if start_dt <= now_utc < end_dt:
+        print(f"[CREATE_SESSION] Session window already active for {session_id}; starting immediately")
+        start_ecs_task(session_id)
+
+    broadcast_to_websocket_clients({
+        "message_type": "session_scheduled",
+        "session_id": session_id,
+        "session_name": data['session_name'],
+        'timezone': session_timezone,
+        "start_time": data['start_time'],
+        "end_time": data['end_time'],
+        "action": "refresh_now"
+    })
+
+    return response(201, {
+        'message': 'Session created successfully',
+        'session': session_item
+    })
+
+def get_race_time_from_ui(session_id, ui_time_str):
+    """
+    Convert UI time (MM:SS) to real race clock time using StartedAt from DynamoDB.
+    """
+
+    result = active_sessions_table.get_item(Key={'SessionId': session_id})
+
+    if 'Item' not in result:
+        raise Exception(f"Session not found: {session_id}")
+
+    started_at = int(result['Item']['StartedAt'])
+
+    try:
+        minutes, seconds = map(int, ui_time_str.split(':'))
+    except BaseException:
+        raise Exception(f"Invalid UI time format: {ui_time_str}")
+
+    minutes, seconds = map(int, ui_time_str.split(':'))
+    ui_seconds = minutes * 60 + seconds
+
+    actual_timestamp = started_at + ui_seconds
+
+    dt = datetime.fromtimestamp(actual_timestamp, tz=timezone.utc)
+
+    return dt.strftime("%H:%M:%S")
+
+def datetime_to_cron(dt):
+    """Convert datetime to EventBridge cron expression.
+
+    EventBridge cron format: cron(minutes hours day-of-month month day-of-week year)
+    For one-time execution, we use specific date values.
+
+    IMPORTANT: EventBridge cron expressions are always in UTC.
+    """
+    from datetime import timezone as tz
+
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(tz.utc)
+
+    print(
+        f"DEBUG - datetime_to_cron: input={dt}, creating cron for {dt.hour}:{dt.minute} UTC on {dt.year}-{dt.month}-{dt.day}")
+
+    return f"cron({dt.minute} {dt.hour} {dt.day} {dt.month} ? {dt.year})"
+
+def list_sessions(status_filter=None):
+    """List sessions, newest first.
+
+    Optional status_filter (case-insensitive) lets the Race Sessions screen
+    request just one tab's worth of data, e.g. ?status=active or
+    ?status=completed. 'active' also includes SCHEDULED (upcoming) sessions so
+    the Active tab shows everything that isn't finished."""
+
+    result = session_table.scan()
+    sessions = result.get('Items', [])
+
+    for s in sessions:
+
+        s = enrich_transcripts_with_time(s)
+        s = add_schedule_columns(s)
+
+        active = active_sessions_table.get_item(
+            Key={'SessionId': s['session_id']},
+            ConsistentRead=True
+        )
+        if 'Item' in active:
+
+            active_item = active['Item']
+
+            s['StartedAt'] = active_item.get('StartedAt')
+
+            if active_item.get('Status') == 'ACTIVE':
+                s['status'] = 'ACTIVE'
+
+            elif active_item.get('Status') == 'STOPPED':
+                s['status'] = 'COMPLETED'
+
+        else:
+            if s.get('status') == 'ACTIVE':
+                s['status'] = 'COMPLETED'
+
+    if status_filter:
+        wanted = status_filter.strip().upper()
+        if wanted == 'ACTIVE':
+            allowed = {'ACTIVE', 'SCHEDULED'}
+        elif wanted == 'COMPLETED':
+            allowed = {'COMPLETED', 'STOPPED'}
+        else:
+            allowed = {wanted}
+        sessions = [s for s in sessions if s.get('status') in allowed]
+
+    sessions.sort(
+        key=lambda x: x.get('start_time', ''),
+        reverse=True
+    )
+
+    return response(200, {'sessions': sessions})
+
+def get_session(session_id):
+    result = session_table.get_item(Key={'session_id': session_id})
+    if 'Item' not in result:
+        return response(404, {'error': 'Session not found'})
+
+    session = result['Item']
+
+    session = enrich_transcripts_with_time(session)
+    session = add_schedule_columns(session)
+
+    return response(200, {'session': session})
+
+
+# def update_session(session_id, data):
+#     """Update an existing session.
+
+#     Accepts drivers in any of these formats:
+#     - driver_ids: ["driver01", "driver02"] - lookup by driver_id (primary key)
+#     - driver_numbers: ["26", "10"] - lookup by car number
+#     - driver_names: ["Colton Herta", "Kyle Kirkwood"] - lookup by driver name
+#     """
+#     result = session_table.get_item(Key={'session_id': session_id})
+#     if 'Item' not in result:
+#         return response(404, {'error': 'Session not found'})
+
+#     existing = result['Item']
+
+#     if existing.get('status') in ['ACTIVE', 'COMPLETED']:
+#         return response(
+#             400, {
+#                 'error': f"Cannot update session with status: {existing.get('status')}"})
+
+#     update_expr_parts = []
+#     expr_attr_values = {}
+#     expr_attr_names = {}
+
+#     simple_fields = ['session_name', 'session_type', 'timezone']
+#     for field in simple_fields:
+#         if field in data:
+#             update_expr_parts.append(f"#{field} = :{field}")
+#             expr_attr_values[f":{field}"] = data[field]
+#             expr_attr_names[f"#{field}"] = field
+
+#     has_driver_update = data.get('driver_ids') or data.get(
+#         'driver_numbers') or data.get('driver_names')
+#     if has_driver_update:
+#         resolved, error = resolve_drivers(data)
+#         if error:
+#             return error
+
+#         driver_snapshot, driver_ids = resolved
+#         print(
+#             f"Resolved {len(driver_snapshot)} drivers for update: {[d['driver_name'] for d in driver_snapshot]}")
+
+#         update_expr_parts.append("#driver_ids = :driver_ids")
+#         expr_attr_values[":driver_ids"] = driver_ids
+#         expr_attr_names["#driver_ids"] = "driver_ids"
+
+#         update_expr_parts.append("#driver_snapshot = :driver_snapshot")
+#         expr_attr_values[":driver_snapshot"] = driver_snapshot
+#         expr_attr_names["#driver_snapshot"] = "driver_snapshot"
+
+#     if 'start_time' in data or 'end_time' in data:
+
+#         new_start = data.get('start_time', existing['start_time'])
+#         new_end = data.get('end_time', existing['end_time'])
+
+#         update_tz = data.get('timezone') or existing.get('timezone') or 'UTC'
+#         start_dt = parse_session_datetime(new_start, update_tz)
+#         end_dt = parse_session_datetime(new_end, update_tz)
+
+#         if has_overlapping_session(start_dt, end_dt, session_id):
+#             return response(400, {
+#                 'error': 'Updated session overlaps with another session'
+#             })
+#         try:
+#             events_client.put_rule(
+#                 Name=existing['eventbridge_start_rule'],
+#                 ScheduleExpression=datetime_to_cron(start_dt),
+#                 State='ENABLED'
+#             )
+#             grant_eventbridge_invoke_permission(existing['eventbridge_start_rule'])
+
+#             events_client.put_rule(
+#                 Name=existing['eventbridge_stop_rule'],
+#                 ScheduleExpression=datetime_to_cron(end_dt),
+#                 State='ENABLED'
+#             )
+#             grant_eventbridge_invoke_permission(existing['eventbridge_stop_rule'])
+#         except Exception as e:
+#             return response(
+#                 500, {
+#                     'error': f'Failed to update EventBridge rules: {str(e)}'})
+
+#     update_expr_parts.append("#start_time = :start_time")
+#     expr_attr_values[":start_time"] = new_start
+#     expr_attr_names["#start_time"] = "start_time"
+
+#     update_expr_parts.append("#end_time = :end_time")
+#     expr_attr_values[":end_time"] = new_end
+#     expr_attr_names["#end_time"] = "end_time"
+
+#     if not update_expr_parts:
+#         return response(400, {'error': 'No valid fields to update'})
+
+#     update_expr_parts.append("#updated_at = :updated_at")
+#     expr_attr_values[":updated_at"] = datetime.utcnow().isoformat() + 'Z'
+#     expr_attr_names["#updated_at"] = "updated_at"
+
+#     session_table.update_item(
+#         Key={'session_id': session_id},
+#         UpdateExpression="SET " + ", ".join(update_expr_parts),
+#         ExpressionAttributeValues=expr_attr_values,
+#         ExpressionAttributeNames=expr_attr_names
+#     )
+
+#     record_audit_event('SESSION_UPDATE', 'session', session_id, get_created_by(data), {
+#         'updated_fields': [k.lstrip(':') for k in expr_attr_values.keys()]
+#     })
+
+#     # A start/end time change is a reschedule — record it distinctly with the
+#     # before/after window so the trail shows exactly what moved.
+#     if 'start_time' in data or 'end_time' in data:
+#         record_audit_event('SESSION_RESCHEDULE', 'session', session_id, get_created_by(data), {
+#             'old_start': existing.get('start_time'),
+#             'old_end': existing.get('end_time'),
+#             'new_start': new_start,
+#             'new_end': new_end
+#         })
+
+#     return get_session(session_id)
+
+def update_session(session_id, data):
+    """Update an existing session.
+
+    Accepts drivers in any of these formats:
+    - driver_ids: ["driver01", "driver02"] - lookup by driver_id (primary key)
+    - driver_numbers: ["26", "10"] - lookup by car number
+    - driver_names: ["Colton Herta", "Kyle Kirkwood"] - lookup by driver name
+    """
+    result = session_table.get_item(Key={'session_id': session_id})
+    if 'Item' not in result:
+        return response(404, {'error': 'Session not found'})
+
+    existing = result['Item']
+
+    if existing.get('status') in ['ACTIVE', 'COMPLETED']:
+        return response(
+            400, {
+                'error': f"Cannot update session with status: {existing.get('status')}"})
+
+    update_expr_parts = []
+    expr_attr_values = {}
+    expr_attr_names = {}
+
+    simple_fields = ['session_name', 'session_type', 'timezone']
+    for field in simple_fields:
+        if field in data:
+            update_expr_parts.append(f"#{field} = :{field}")
+            expr_attr_values[f":{field}"] = data[field]
+            expr_attr_names[f"#{field}"] = field
+
+    has_driver_update = data.get('driver_ids') or data.get(
+        'driver_numbers') or data.get('driver_names')
+    if has_driver_update:
+        resolved, error = resolve_drivers(data)
+        if error:
+            return error
+
+        driver_snapshot, driver_ids = resolved
+        print(
+            f"Resolved {len(driver_snapshot)} drivers for update: {[d['driver_name'] for d in driver_snapshot]}")
+
+        update_expr_parts.append("#driver_ids = :driver_ids")
+        expr_attr_values[":driver_ids"] = driver_ids
+        expr_attr_names["#driver_ids"] = "driver_ids"
+
+        update_expr_parts.append("#driver_snapshot = :driver_snapshot")
+        expr_attr_values[":driver_snapshot"] = driver_snapshot
+        expr_attr_names["#driver_snapshot"] = "driver_snapshot"
+
+    # FIX: resolve new_start / new_end / update_tz BEFORE the conditional, so the
+    # SET clause below never references an undefined name. A PUT without
+    # start_time/end_time (timezone-only edit, rename, driver change) previously
+    # raised NameError: name 'new_start' is not defined -> 500.
+    new_start = data.get('start_time', existing.get('start_time'))
+    new_end = data.get('end_time', existing.get('end_time'))
+    update_tz = data.get('timezone') or existing.get('timezone') or 'UTC'
+
+    if 'start_time' in data or 'end_time' in data:
+        start_dt = parse_session_datetime(new_start, update_tz)
+        end_dt = parse_session_datetime(new_end, update_tz)
+
+        if has_overlapping_session(start_dt, end_dt, session_id):
+            return response(400, {
+                'error': 'Updated session overlaps with another session'
+            })
+        try:
+            events_client.put_rule(
+                Name=existing['eventbridge_start_rule'],
+                ScheduleExpression=datetime_to_cron(start_dt),
+                State='ENABLED'
+            )
+            grant_eventbridge_invoke_permission(existing['eventbridge_start_rule'])
+
+            events_client.put_rule(
+                Name=existing['eventbridge_stop_rule'],
+                ScheduleExpression=datetime_to_cron(end_dt),
+                State='ENABLED'
+            )
+            grant_eventbridge_invoke_permission(existing['eventbridge_stop_rule'])
+        except Exception as e:
+            return response(
+                500, {
+                    'error': f'Failed to update EventBridge rules: {str(e)}'})
+
+    update_expr_parts.append("#start_time = :start_time")
+    expr_attr_values[":start_time"] = new_start
+    expr_attr_names["#start_time"] = "start_time"
+
+    update_expr_parts.append("#end_time = :end_time")
+    expr_attr_values[":end_time"] = new_end
+    expr_attr_names["#end_time"] = "end_time"
+
+    if not update_expr_parts:
+        return response(400, {'error': 'No valid fields to update'})
+
+    update_expr_parts.append("#updated_at = :updated_at")
+    expr_attr_values[":updated_at"] = datetime.utcnow().isoformat() + 'Z'
+    expr_attr_names["#updated_at"] = "updated_at"
+
+    session_table.update_item(
+        Key={'session_id': session_id},
+        UpdateExpression="SET " + ", ".join(update_expr_parts),
+        ExpressionAttributeValues=expr_attr_values,
+        ExpressionAttributeNames=expr_attr_names
+    )
+
+    record_audit_event('SESSION_UPDATE', 'session', session_id, get_created_by(data), {
+        'updated_fields': [k.lstrip(':') for k in expr_attr_values.keys()]
+    })
+
+    # A start/end time change is a reschedule — record it distinctly with the
+    # before/after window so the trail shows exactly what moved.
+    if 'start_time' in data or 'end_time' in data:
+        record_audit_event('SESSION_RESCHEDULE', 'session', session_id, get_created_by(data), {
+            'old_start': existing.get('start_time'),
+            'old_end': existing.get('end_time'),
+            'new_start': new_start,
+            'new_end': new_end
+        })
+
+    return get_session(session_id)
+
+
+def delete_session(session_id, actor='unknown'):
+    """Delete a session and its EventBridge rules."""
+    result = session_table.get_item(Key={'session_id': session_id})
+    if 'Item' not in result:
+        return response(404, {'error': 'Session not found'})
+
+    existing = result['Item']
+
+    # Keep delete enabled for ACTIVE sessions by stopping resources first.
+    active_row = active_sessions_table.get_item(Key={'SessionId': session_id}).get('Item') or {}
+    if existing.get('status') == 'ACTIVE' or active_row.get('Status') == 'ACTIVE':
+        print(f"[DELETE] Session {session_id} is ACTIVE. Stopping ECS before delete.")
+        stop_result = stop_ecs_task(session_id)
+        try:
+            stop_code = int(stop_result.get('statusCode', 500))
+        except Exception:
+            stop_code = 500
+        if stop_code >= 400:
+            print(f"[DELETE] Failed to stop active session {session_id}: {stop_result}")
+            return response(500, {'error': 'Failed to stop active session before delete'})
+
+    try:
+        start_rule = existing.get('eventbridge_start_rule')
+        stop_rule = existing.get('eventbridge_stop_rule')
+        if start_rule:
+            events_client.remove_targets(
+                Rule=start_rule,
+                Ids=[f"start-{session_id}"]
+            )
+            events_client.delete_rule(Name=start_rule, Force=True)
+        if stop_rule:
+            events_client.remove_targets(
+                Rule=stop_rule,
+                Ids=[f"stop-{session_id}"]
+            )
+            events_client.delete_rule(Name=stop_rule, Force=True)
+    except Exception as e:
+        print(f"Warning: Error deleting EventBridge rules: {str(e)}")
+
+    session_table.delete_item(Key={'session_id': session_id})
+
+    try:
+        active_sessions_table.delete_item(Key={'SessionId': session_id})
+    except BaseException:
+        pass
+
+    record_audit_event('SESSION_DELETE', 'session', session_id, actor, {
+        'session_name': existing.get('session_name')
+    })
+
+    return response(200, {'message': 'Session deleted successfully'})
+
+
+def start_session_manually(session_id, actor='unknown'):
+    """Manually start a session (trigger ECS)."""
+    return start_ecs_task(session_id, actor=actor)
+
+
+def stop_session_manually(session_id, actor='unknown'):
+    """Manually stop a session (stop ECS)."""
+    return stop_ecs_task(session_id, actor=actor)
+
+
+def create_task_definition_revision(session_id, driver_configs):
+    """
+    Create a new ECS task definition revision for a specific session.
+
+    This creates a new revision of the existing task definition family
+    with SESSION_ID and driver environment variables baked in.
+
+    Example:
+    - Base: v2_req_ingester:1
+    - Session 1: v2_req_ingester:2 (with SESSION_ID, DRIVER_01_URL, etc.)
+    - Session 2: v2_req_ingester:3 (with different SESSION_ID, DRIVER_01_URL, etc.)
+    """
+    import copy
+
+    print(f"Creating new task definition revision for session: {session_id}")
+
+    base_task_def = ecs_client.describe_task_definition(
+        taskDefinition=ECS_TASK_DEFINITION)
+    task_def = base_task_def['taskDefinition']
+
+    container_defs = copy.deepcopy(task_def['containerDefinitions'])
+
+    for container in container_defs:
+        if container['name'] == ECS_CONTAINER_NAME:
+            existing_env = container.get('environment', [])
+
+            filtered_env = [
+                env for env in existing_env
+                if not env['name'].startswith('SESSION_ID')
+                and not env['name'].startswith('DRIVER_')
+            ]
+
+            filtered_env.append({'name': 'SESSION_ID', 'value': session_id})
+
+            for idx, driver in enumerate(driver_configs, start=1):
+                driver_prefix = f'DRIVER_{idx:02d}'
+                filtered_env.append(
+                    {'name': f'{driver_prefix}_URL', 'value': driver.get('stream_url', '')})
+                filtered_env.append(
+                    {'name': f'{driver_prefix}_NAME', 'value': driver.get('driver_name', '')})
+                filtered_env.append(
+                    {'name': f'{driver_prefix}_TEAM', 'value': driver.get('team', '')})
+
+            container['environment'] = filtered_env
+
+            driver_env_count = len(
+                [e for e in filtered_env if e['name'].startswith('DRIVER_')])
+            print(f"Updated container {ECS_CONTAINER_NAME}:")
+            print(f"  - SESSION_ID: {session_id}")
+            print(
+                f"  - Driver env vars: {driver_env_count} (for {len(driver_configs)} drivers)")
+            for env in filtered_env:
+                if env['name'].startswith(
+                        'DRIVER_') or env['name'] == 'SESSION_ID':
+                    print(f"  - {env['name']}: {env['value'][:50]}...")
+            break
+
+    register_params = {
+        'family': task_def['family'],
+        'containerDefinitions': container_defs,
+        'networkMode': task_def.get(
+            'networkMode',
+            'awsvpc'),
+        'requiresCompatibilities': task_def.get(
+            'requiresCompatibilities',
+            ['FARGATE']),
+        'cpu': task_def.get(
+            'cpu',
+            '256'),
+        'memory': task_def.get(
+            'memory',
+            '512')}
+
+    if task_def.get('taskRoleArn'):
+        register_params['taskRoleArn'] = task_def['taskRoleArn']
+    if task_def.get('executionRoleArn'):
+        register_params['executionRoleArn'] = task_def['executionRoleArn']
+    if task_def.get('runtimePlatform'):
+        register_params['runtimePlatform'] = task_def['runtimePlatform']
+
+    new_task_def = ecs_client.register_task_definition(**register_params)
+
+    new_task_def_arn = new_task_def['taskDefinition']['taskDefinitionArn']
+    revision = new_task_def['taskDefinition']['revision']
+    print(
+        f"Created new task definition revision: {task_def['family']}:{revision}")
+    print(f"Task definition ARN: {new_task_def_arn}")
+
+    return new_task_def_arn
+
+
+def start_ecs_task(session_id, actor='system'):
+    """
+    Start ECS task for a session.
+
+    This function:
+    1. Reads the session config from v2_SessionConfig (includes driver_snapshot)
+    2. Uses driver_snapshot which was saved when session was created
+    3. Creates a NEW task definition revision with driver configs baked in
+    4. Starts ECS Fargate task using the new revision
+
+    Why create new revision instead of env var overrides:
+    - ECS env var overrides don't work reliably in some configurations
+    - Each session has its own traceable task definition revision
+    - Better debugging - you can see exactly what config was used
+    """
+    print(f"DEBUG - Starting ECS task for session: {session_id}")
+    print(f"DEBUG - ECS_CLUSTER: {ECS_CLUSTER}")
+    print(f"DEBUG - ECS_TASK_DEFINITION: {ECS_TASK_DEFINITION}")
+    print(f"DEBUG - ECS_SUBNETS: {ECS_SUBNETS}")
+    print(f"DEBUG - ECS_SECURITY_GROUPS: {ECS_SECURITY_GROUPS}")
+
+    result = session_table.get_item(Key={'session_id': session_id})
+    if 'Item' not in result:
+        print(f"Session not found: {session_id}")
+        return response(404, {'error': 'Session not found'})
+
+    session = result['Item']
+
+    # Once a session has been completed (manually stopped, auto-stopped, or ended
+    # early), it must NEVER be (re)started — not by its scheduled START trigger
+    # and not by a manual call. Completed stays completed. This is what stops a
+    # session that finished BEFORE its scheduled start_time from springing back
+    # to life when the EventBridge START rule fires, even if another session
+    # shares the same name.
+    active_row = active_sessions_table.get_item(
+        Key={'SessionId': session_id}).get('Item') or {}
+    if session.get('status') == 'COMPLETED' or active_row.get('Status') == 'STOPPED':
+        print(f"Session {session_id} already completed/stopped; not starting (actor={actor}).")
+        if session.get('status') != 'COMPLETED':
+            session_table.update_item(
+                Key={'session_id': session_id},
+                UpdateExpression="SET #status = :status",
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={':status': 'COMPLETED'}
+            )
+        return response(400, {'error': 'Session already completed; it will not restart'})
+
+    from datetime import timezone
+
+    now_utc = datetime.now(timezone.utc)
+
+    # Parse end_time with the session's stored timezone, exactly as create_session
+    # scheduled the EventBridge STOP rule. Using bare fromisoformat() here treated a
+    # naive local end_time as UTC, so this expiry check disagreed with the schedule
+    # (and could crash comparing aware-vs-naive), wrongly marking sessions COMPLETED
+    # and refusing to start them before their real end time.
+    end_dt = parse_session_datetime(session['end_time'], session.get('timezone'))
+
+    if now_utc >= end_dt:
+        print(f"Session {session_id} already expired. Not starting ECS.")
+
+        session_table.update_item(
+            Key={'session_id': session_id},
+            UpdateExpression="SET #status = :status",
+            ExpressionAttributeNames={'#status': 'status'},
+            ExpressionAttributeValues={':status': 'COMPLETED'}
+        )
+
+        return response(400, {'error': 'Session already ended'})
+
+
+    existing_active = get_active_session()
+
+    if existing_active:
+        return response(
+            400, {
+                'error': f"Another session is already ACTIVE: {existing_active['SessionId']}"})
+    active_result = active_sessions_table.get_item(
+        Key={'SessionId': session_id})
+    if 'Item' in active_result and active_result['Item'].get(
+            'Status') == 'ACTIVE':
+        print(f"Session already active: {session_id}")
+        return response(400, {'error': 'Session is already active'})
+
+    driver_configs = session.get('driver_snapshot', [])
+
+    if not driver_configs:
+        print(f"No driver_snapshot found, falling back to driver table")
+        for driver_id in session.get('driver_ids', []):
+            driver_result = driver_table.get_item(Key={'driver_id': driver_id})
+            if 'Item' in driver_result:
+                driver = driver_result['Item']
+                if driver.get('is_active', True):
+                    driver_configs.append({
+                        'driver_id': driver['driver_id'],
+                        'driver_name': driver.get('driver_name', ''),
+                        'driver_number': str(driver.get('driver_number', '')),
+                        'team': driver.get('team', ''),
+                        'stream_url': driver.get('stream_url', ''),
+                        'driver_address': driver.get('driver_address', '')
+                    })
+
+    if not driver_configs:
+        print(f"No active drivers found for session: {session_id}")
+        return response(
+            400, {
+                'error': 'No active drivers configured for this session'})
+
+    print(f"Driver configs for ECS: {json.dumps(driver_configs)}")
+
+    try:
+        new_task_def_arn = create_task_definition_revision(
+            session_id, driver_configs)
+    except Exception as e:
+        print(f"Error creating task definition revision: {str(e)}")
+        return response(
+            500, {
+                'error': f'Failed to create task definition: {str(e)}'})
+
+    print(
+        f"DEBUG - Starting ECS task with task definition: {new_task_def_arn}")
+    try:
+        subnets = [s.strip() for s in ECS_SUBNETS if s.strip()]
+        security_groups = [s.strip() for s in ECS_SECURITY_GROUPS if s.strip()]
+        print(f"DEBUG - Subnets: {subnets}")
+        print(f"DEBUG - Security Groups: {security_groups}")
+
+        ecs_response = ecs_client.run_task(
+            cluster=ECS_CLUSTER,
+            taskDefinition=new_task_def_arn,
+            launchType='FARGATE',
+            startedBy=session_id,
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': subnets,
+                    'securityGroups': security_groups,
+                    'assignPublicIp': 'ENABLED'
+                }
+            }
+        )
+
+        print(
+            f"DEBUG - ECS run_task response: {json.dumps(ecs_response, default=str)}")
+
+        task_arn = ecs_response['tasks'][0]['taskArn'] if ecs_response.get(
+            'tasks') else None
+
+        if not task_arn:
+            failures = ecs_response.get('failures', [])
+            raise Exception(f"Failed to start ECS task: {failures}")
+
+        print(f"DEBUG - ECS task started successfully: {task_arn}")
+
+    except Exception as e:
+        print(f"Error starting ECS task: {str(e)}")
+
+        active_sessions_table.put_item(Item={
+            'SessionId': session_id,
+            'Status': 'ERROR',
+            'ErrorMessage': str(e),
+            'TaskDefinitionArn': new_task_def_arn,
+            'StartedAt': int(time.time())
+        })
+
+        return response(500, {'error': f'Failed to start ECS task: {str(e)}'})
+
+    now_ts = int(time.time())
+    session_table.update_item(
+        Key={
+            'session_id': session_id},
+        UpdateExpression="SET #status = :status, #updated_at = :updated_at, #started_at = :started_at",
+        ExpressionAttributeNames={
+            '#status': 'status',
+            '#updated_at': 'updated_at',
+            '#started_at': 'started_at'},
+        ExpressionAttributeValues={
+            ':status': 'ACTIVE',
+            ':updated_at': datetime.utcnow().isoformat() + 'Z',
+            ':started_at': now_ts})
+
+    now_ts = int(time.time())
+    # Parse RaceStartAt with the session's stored timezone (same as the START/STOP
+    # scheduling and the expiry check). A bare fromisoformat() left a naive
+    # local time, which .timestamp() then read as UTC — drifting the race clock
+    # and pre-race buffer by the offset (e.g. 5h30m for IST sessions).
+    race_start_dt = parse_session_datetime(
+        session['start_time'], session.get('timezone'))
+
+    race_start_ts = int(race_start_dt.timestamp())
+
+    active_session_item = {
+        'SessionId': session_id,
+        'Status': 'ACTIVE',
+        'EcsTaskArns': [task_arn],
+        'TaskDefinitionArn': new_task_def_arn,
+
+        'StartedAt': now_ts,
+
+        'RaceStartAt': race_start_ts,
+
+        'UpdatedAt': now_ts,
+        'DriverCount': len(driver_configs)
+    }
+    print(
+        f"DEBUG - Saving to ActiveSessions: {json.dumps(active_session_item, default=str)}")
+    # Upsert ACTIVE state so scheduled restarts or previously-stopped rows do
+    # not fail with ConditionalCheckFailedException.
+    active_sessions_table.put_item(Item=active_session_item)
+    print(f"DEBUG - Successfully upserted ActiveSessions table")
+
+    record_audit_event('SESSION_START', 'session', session_id, actor, {
+        'task_arn': task_arn,
+        'driver_count': len(driver_configs)
+    })
+
+    broadcast_to_websocket_clients({
+        "message_type": "session_started",
+        "session_id": session_id,
+        "started_at": now_ts,
+        "race_start_at": race_start_ts,
+        "action": "refresh_now",
+        "should_refresh_page": True,
+        "trigger": "auto_or_manual_start"
+    })
+
+    return response(200, {
+        'message': 'ECS task started successfully',
+        'session_id': session_id,
+        'task_arn': task_arn,
+        'task_definition_arn': new_task_def_arn,
+        'driver_count': len(driver_configs),
+        'drivers': [d['driver_name'] for d in driver_configs]
+    })
+
+
+def stop_ecs_task(session_id, actor='system'):
+    """Stop ECS task for a session."""
+    print(f"Stopping ECS task for session: {session_id}")
+
+    session_result = session_table.get_item(Key={'session_id': session_id})
+    if 'Item' in session_result:
+        session = session_result['Item']
+        # Use the session's stored timezone (same as scheduling) so this check is
+        # tz-aware and consistent; bare fromisoformat() misread naive local times.
+        end_dt = parse_session_datetime(session['end_time'], session.get('timezone'))
+
+        now_utc = datetime.now(timezone.utc)
+
+        if now_utc < end_dt:
+            print("WARNING: Stop called before session end_time")
+
+    try:
+        scan_result = active_sessions_table.scan(Limit=10)
+        print(f"DEBUG - Active sessions in table ({ACTIVE_SESSIONS_TABLE}):")
+        for item in scan_result.get('Items', []):
+            print(
+                f"  - SessionId: {item.get('SessionId')}, Status: {item.get('Status')}")
+        if not scan_result.get('Items'):
+            print("  - (table is empty)")
+    except Exception as e:
+        print(f"DEBUG - Error scanning active sessions table: {e}")
+
+    print(
+        f"DEBUG - Looking up SessionId: '{session_id}' in table: {ACTIVE_SESSIONS_TABLE}")
+    active_result = active_sessions_table.get_item(
+        Key={'SessionId': session_id})
+    print(
+        f"DEBUG - Lookup result: {json.dumps(active_result, cls=DecimalEncoder)}")
+
+    if 'Item' not in active_result:
+        print(f"No active session found: {session_id}")
+        session_table.update_item(
+            Key={
+                'session_id': session_id},
+            UpdateExpression="SET #status = :status, #updated_at = :updated_at",
+            ExpressionAttributeNames={
+                '#status': 'status',
+                '#updated_at': 'updated_at'},
+            ExpressionAttributeValues={
+                ':status': 'COMPLETED',
+                ':updated_at': datetime.utcnow().isoformat() + 'Z'})
+        record_audit_event('SESSION_STOP', 'session', session_id, actor, {
+            'note': 'no active task found; marked completed'})
+        return response(
+            200, {
+                'message': 'Session marked as completed (no active task found)'})
+
+    active_session = active_result['Item']
+
+
+
+    task_arns = active_session.get('EcsTaskArns', [])
+
+    for task in task_arns:
+        try:
+            ecs_client.stop_task(
+                cluster=ECS_CLUSTER,
+                task=task,
+                reason=f'Session {session_id} ended'
+            )
+            print(f"ECS task stopped: {task}")
+        except Exception as e:
+            print(f"Error stopping ECS task {task}: {str(e)}")
+    print(f"DEBUG - Updating session status in {SESSION_TABLE}")
+
+    try:
+        session_table.update_item(
+            Key={
+                'session_id': session_id},
+            UpdateExpression="SET #status = :status, #updated_at = :updated_at",
+            ExpressionAttributeNames={
+                '#status': 'status',
+                '#updated_at': 'updated_at'},
+            ExpressionAttributeValues={
+                ':status': 'COMPLETED',
+                ':updated_at': datetime.utcnow().isoformat() + 'Z'})
+
+        print(
+            f"DEBUG - Session status updated to COMPLETED in {SESSION_TABLE}")
+
+    except Exception as e:
+        print(f"DEBUG - Error updating session status: {str(e)}")
+
+
+    print(f"DEBUG - Updating active session status in {ACTIVE_SESSIONS_TABLE}")
+
+    try:
+        now_ts = int(time.time())
+
+        active_sessions_table.update_item(
+            Key={'SessionId': session_id},
+            UpdateExpression="SET #status = :status, #stopped_at = :stopped_at, #updated_at = :updated_at",
+            ExpressionAttributeNames={
+                '#status': 'Status',
+                '#stopped_at': 'StoppedAt',
+                '#updated_at': 'UpdatedAt'
+            },
+            ExpressionAttributeValues={
+                ':status': 'STOPPED',
+                ':stopped_at': now_ts,
+                ':updated_at': now_ts
+            }
+        )
+
+        print(f"DEBUG - Active session status updated to STOPPED")
+
+    except Exception as e:
+        print(f"DEBUG - Error updating active session: {str(e)}")
+
+
+    print(f"DEBUG - Disabling EventBridge rules")
+    try:
+        session_result = session_table.get_item(Key={'session_id': session_id})
+        if 'Item' in session_result:
+            session = session_result['Item']
+            if session.get('eventbridge_start_rule'):
+
+                events_client.remove_targets(
+                    Rule=session['eventbridge_start_rule'],
+                    Ids=[f"start-{session_id}"]
+                )
+
+                events_client.delete_rule(
+                    Name=session['eventbridge_start_rule'],
+                    Force=True
+                )
+                print(
+                    f"DEBUG - Disabled start rule: {session['eventbridge_start_rule']}")
+            if session.get('eventbridge_stop_rule'):
+                try:
+                    events_client.remove_targets(
+                        Rule=session['eventbridge_stop_rule'],
+                        Ids=[f"stop-{session_id}"]
+                    )
+                except Exception as e:
+                    print(f"DEBUG - remove_targets on stop rule failed (continuing): {e}")
+                events_client.delete_rule(
+                    Name=session['eventbridge_stop_rule'],
+                    Force=True
+                )
+                print(
+                    f"DEBUG - Disabled stop rule: {session['eventbridge_stop_rule']}")
+        else:
+            print(
+                f"DEBUG - No session found in {SESSION_TABLE} for EventBridge rule cleanup")
+    except Exception as e:
+        print(f"Warning: Error disabling EventBridge rules: {str(e)}")
+
+    # REMOVED (2026-08-19): live sessions do NOT need v2_audio_merge_lambda.
+    # Fargate's ingester.py already writes the complete, reliable full-race
+    # recording directly to full-race-recordings/{session_id}/{driver}/full_session.mp3
+    # for every driver, as soon as the container shuts down. Verified via
+    # CloudShell against a real race (20 drivers): the merge Lambda's live
+    # output only had 4/20 drivers even though it logged AUDIO_MERGE_SUCCESS -
+    # i.e. it was silently incomplete and redundant. The upload flow's merge
+    # call (check_stale_upload_sessions, which sends "flow": "upload") is
+    # UNCHANGED - uploads still need it, since Fargate never touches uploads.
+    print(f"DEBUG - Skipping audio merge for live session {session_id}; "
+          f"Fargate already wrote the full recording directly.")
+
+    print(
+        f"DEBUG - Stop function completed successfully for session: {session_id}")
+
+    record_audit_event('SESSION_STOP', 'session', session_id, actor, {
+        'task_arns': task_arns
+    })
+
+    broadcast_to_websocket_clients({
+        "message_type": "session_stopped",
+        "session_id": session_id,
+        "stopped_at": int(time.time()),
+        "grace_period_seconds": 120,
+        "action": "refresh_after",
+        "refresh_after_seconds": 120
+    })
+
+    return response(200, {
+        'message': 'ECS task stopped successfully',
+        'session_id': session_id
+    })
+
+
+def response(status_code, body):
+    """Create API Gateway response."""
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS'
+        },
+        'body': json.dumps(body, cls=DecimalEncoder)
+    }
+
+
+def find_overlapping_session_name(start_dt, end_dt, exclude_session_id=None):
+    """Return the session_name of the first SCHEDULED/ACTIVE session whose
+    time window overlaps [start_dt, end_dt), or None if no conflict.
+
+    Returning the name (not just a bool) lets the API surface the specific
+    conflicting session in the validation message."""
+    result = session_table.scan()
+    sessions = result.get('Items', [])
+
+    for session in sessions:
+        if exclude_session_id and session['session_id'] == exclude_session_id:
+            continue
+
+        if session.get('status') in ['COMPLETED', 'STOPPED']:
+            continue
+
+        existing_start = datetime.fromisoformat(
+            session['start_time'].replace('Z', '+00:00')
+        )
+        existing_end = datetime.fromisoformat(
+            session['end_time'].replace('Z', '+00:00')
+        )
+
+        if start_dt < existing_end and end_dt > existing_start:
+            return session.get('session_name') or session.get('session_id')
+
+    return None
+
+
+def has_overlapping_session(start_dt, end_dt, exclude_session_id=None):
+    """Backwards-compatible boolean wrapper around find_overlapping_session_name."""
+    return find_overlapping_session_name(start_dt, end_dt, exclude_session_id) is not None
+
+
+def find_session_name_conflict(session_name, exclude_session_id=None):
+    """Return the session_id of a non-completed session that already uses
+    this name (case-insensitive, trimmed), or None if the name is free.
+    Completed/Stopped sessions are ignored so names can be reused historically."""
+    if not session_name:
+        return None
+    target = str(session_name).strip().lower()
+    if not target:
+        return None
+
+    result = session_table.scan()
+    for session in result.get('Items', []):
+        if exclude_session_id and session.get('session_id') == exclude_session_id:
+            continue
+        if session.get('status') in ['COMPLETED', 'STOPPED']:
+            continue
+        existing = str(session.get('session_name', '')).strip().lower()
+        if existing and existing == target:
+            return session.get('session_id')
+    return None
+
+
+def get_active_session():
+
+    result = active_sessions_table.scan()
+
+    for item in result.get('Items', []):
+
+        if item.get('Status') == 'ACTIVE':
+
+
+            return item
+
+    return None
+
+def enrich_transcripts_with_time(session):
+    """
+    Updates the transcripts of a session to include display_time.
+    display_time is HH:MM:SS relative to the scheduled race start_time.
+    Transcripts that occur before race start are prefixed with '-' (e.g. '-00:15:00').
+    """
+    transcripts = session.get("transcripts", [])
+    if not transcripts:
+        return session
+
+    session_id = session['session_id']
+    started_at = None
+    started_at_source = None
+
+    session_started_at = session.get('started_at')
+    if session_started_at:
+        try:
+            started_at = int(session_started_at)
+            started_at_source = "session.started_at"
+        except (TypeError, ValueError):
+            started_at = None
+
+    if started_at is None:
+        try:
+            active = active_sessions_table.get_item(
+                Key={'SessionId': session_id},
+                ConsistentRead=True
+            )
+            if 'Item' in active and active['Item'].get('StartedAt'):
+                started_at = int(active['Item']['StartedAt'])
+                started_at_source = "active.StartedAt"
+        except Exception as e:
+            print(f"DEBUG - active table lookup failed for {session_id}: {e}")
+
+    try:
+        race_start_ts = int(
+            datetime.fromisoformat(
+                session['start_time'].replace('Z', '+00:00')
+            ).timestamp()
+        )
+    except (KeyError, ValueError, AttributeError, TypeError) as e:
+        print(f"DEBUG - Could not parse session.start_time ({e}); display_time will be relative to started_at")
+        race_start_ts = started_at
+
+    if started_at is None:
+        started_at = race_start_ts
+        started_at_source = "start_time fallback"
+
+    print(f"DEBUG - started_at={started_at} (source={started_at_source}), race_start_ts={race_start_ts}, session={session_id}")
+
+    def parse_offset(offset_val):
+        """Return total seconds (int) for MM:SS or HH:MM:SS, or None if missing/unparseable."""
+        if offset_val is None or offset_val == "":
+            return None
+        try:
+            parts = list(map(int, str(offset_val).split(":")))
+        except (ValueError, AttributeError):
+            return None
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return None
+
+    parsed_seconds = [parse_offset(t.get("offset")) for t in transcripts]
+
+    missing_idx = [i for i, s in enumerate(parsed_seconds) if s is None]
+    if missing_idx:
+        print(
+            f"DEBUG - {len(missing_idx)}/{len(transcripts)} transcripts missing/unparseable offset "
+            f"for session {session_id}; indices={missing_idx[:20]}"
+            f"{'...' if len(missing_idx) > 20 else ''}")
+
+    for i in range(len(parsed_seconds) - 2, -1, -1):
+        if parsed_seconds[i] is None and parsed_seconds[i + 1] is not None:
+            parsed_seconds[i] = parsed_seconds[i + 1]
+
+    for i in range(1, len(parsed_seconds)):
+        if parsed_seconds[i] is None and parsed_seconds[i - 1] is not None:
+            parsed_seconds[i] = parsed_seconds[i - 1]
+
+    formatted = []
+    for t, total_seconds in zip(transcripts, parsed_seconds):
+        display = "00:00"
+        delta_val = None
+        try:
+            if total_seconds is not None:
+                actual_ts = started_at + total_seconds
+                delta = actual_ts - race_start_ts
+                delta_val = delta
+                sign = "-" if delta < 0 else ""
+                abs_delta = abs(delta)
+                hours = abs_delta // 3600
+                minutes = (abs_delta % 3600) // 60
+                seconds = abs_delta % 60
+                if hours > 0:
+                    display = f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+                else:
+                    display = f"{sign}{minutes:02d}:{seconds:02d}"
+        except Exception as e:
+            print(f"Error calculating display_time: {e}")
+
+        formatted.append({
+            **t,
+            "display_time": display,
+            "display_time_seconds": delta_val
+        })
+
+    # Show the conversation in ascending race-time order. For a manually-started
+    # session the pre-race audio yields negative times; sorting numerically keeps
+    # them first (-MM:SS) and crossing 00:00 into positive times, instead of
+    # ordering by the raw offset or string. Transcripts whose offset could not be
+    # parsed keep their original relative order at the end.
+    formatted.sort(key=lambda x: (x.get("display_time_seconds") is None,
+                                  x.get("display_time_seconds") or 0))
+
+    session["transcripts"] = formatted
+    return session
+

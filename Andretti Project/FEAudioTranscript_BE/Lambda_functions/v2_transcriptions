@@ -1,0 +1,201 @@
+########### 16/07/2026 ########
+"""
+Transcription Lambda
+Starts AWS Transcribe jobs for silence-removed audio files
+
+Trigger: S3 event when MP3 is uploaded to silence-removed-mp3-chunks/
+Output: Transcription JSON to transcriptions/ bucket
+
+Author: People Tech Group
+Updated: December 29, 2024
+"""
+
+import boto3
+import os
+import re
+import time
+import uuid
+import urllib.parse
+import json
+from datetime import datetime
+
+S3_BUCKET = os.environ.get("S3_BUCKET", "test-v2-andretti-transcription-system")
+
+INPUT_PREFIX = "silence-removed/"
+
+OUTPUT_PREFIX = "transcriptions/"
+
+CUSTOM_VOCABULARY_NAME = os.environ.get("CUSTOM_VOCABULARY_NAME", None)
+
+s3_client = boto3.client('s3')
+transcribe_client = boto3.client('transcribe')
+
+AUDIT_S3_BUCKET = os.environ.get('AUDIT_S3_BUCKET', 'test-v2-andretti-audit-logs')
+AUDIT_S3_PREFIX = os.environ.get('AUDIT_S3_PREFIX', 'audit-logs/')
+SESSION_LOGS_PREFIX = os.environ.get('SESSION_LOGS_PREFIX', 'session_logs/')
+SYSTEM_LOGS_PREFIX = os.environ.get('SYSTEM_LOGS_PREFIX', 'system_logs/')
+SESSION_SCOPED_ENTITIES = {'pipeline', 'session', 'session_config', 'recording'}
+
+
+def record_audit_event(action, entity, entity_id, created_by, details=None):
+    """Write an audit-trail record to S3 in three places: a date partition
+    (unchanged), session_logs/{session_id}/ for session-scoped entities (this
+    Lambda's events are all entity='pipeline', so always here), or
+    system_logs/YYYY/MM/DD/ otherwise. No-op if AUDIT_S3_BUCKET is unset;
+    never raises."""
+    if not AUDIT_S3_BUCKET:
+        return
+    try:
+        now = datetime.utcnow()
+        record = {
+            'audit_id': str(uuid.uuid4()),
+            'timestamp': now.isoformat() + 'Z',
+            'action': action,
+            'entity': entity,
+            'entity_id': str(entity_id) if entity_id is not None else '',
+            'created_by': created_by or 'unknown',
+            'details': details or {}
+        }
+        suffix = f"{action}_{int(now.timestamp())}_{record['audit_id'][:8]}.json"
+        body = json.dumps(record, default=str).encode('utf-8')
+        date_path = now.strftime('%Y/%m/%d')
+        s3_client.put_object(
+            Bucket=AUDIT_S3_BUCKET,
+            Key=f"{AUDIT_S3_PREFIX}{date_path}/{suffix}",
+            Body=body,
+            ContentType='application/json'
+        )
+        if entity in SESSION_SCOPED_ENTITIES and record['entity_id']:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SESSION_LOGS_PREFIX}{record['entity_id']}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+        else:
+            s3_client.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SYSTEM_LOGS_PREFIX}{date_path}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+    except Exception as e:
+        print(f"[AUDIT] Failed to record {action} for {entity}:{entity_id}: {e}")
+
+
+def lambda_handler(event, context):
+    if "Records" not in event:
+        raise ValueError("This Lambda must be triggered by S3 events.")
+
+    results = []
+
+    for record in event["Records"]:
+        input_bucket = record["s3"]["bucket"]["name"]
+        input_key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+
+        SUPPORTED_FORMATS = {
+            '.mp3': 'mp3',
+            '.mp4': 'mp4',
+            '.m4a': 'mp4',
+            '.wav': 'wav',
+            '.flac': 'flac',
+            '.ogg': 'ogg',
+            '.webm': 'webm'
+        }
+
+        file_ext = os.path.splitext(input_key.lower())[1]
+        if file_ext not in SUPPORTED_FORMATS:
+            print(f"Skipping unsupported file format: {input_key}")
+            results.append({
+                'status': 'ignored',
+                'file': input_key,
+                'reason': f'Unsupported format: {file_ext}'
+            })
+            continue
+
+        media_format = SUPPORTED_FORMATS[file_ext]
+
+        key_parts = input_key.replace(INPUT_PREFIX, "").split("/")
+        session_id = key_parts[0] if len(key_parts) >= 1 else "unknown"
+        driver_folder = key_parts[1] if len(key_parts) >= 2 else None
+
+        if not driver_folder:
+            print(f"Skipping file with no driver folder: {input_key}")
+            results.append({
+                'status': 'ignored',
+                'file': input_key,
+                'reason': 'No driver folder found'
+            })
+            continue
+
+        print(f"Detected session: {session_id}, driver folder: {driver_folder}")
+
+        s3_uri = f"s3://{input_bucket}/{input_key}"
+
+        sanitized_driver = re.sub(r'[^0-9a-zA-Z._-]', '_', driver_folder)
+        base_filename = os.path.basename(input_key)
+        job_base = os.path.splitext(base_filename)[0]
+        job_name = f"transcribe-{sanitized_driver}-{job_base}-{int(time.time())}"
+
+        print(f"Starting Transcribe job {job_name} for media: {s3_uri}")
+
+
+        transcribe_settings = {
+            'ShowSpeakerLabels': True,
+            'MaxSpeakerLabels': 2,
+            'ShowAlternatives': True,
+            'MaxAlternatives': 3
+        }
+
+        if CUSTOM_VOCABULARY_NAME:
+            transcribe_settings["VocabularyName"] = CUSTOM_VOCABULARY_NAME
+
+        output_s3_prefix = f"{OUTPUT_PREFIX}{session_id}/{driver_folder}/"
+
+        try:
+            transcribe_client.start_transcription_job(
+                TranscriptionJobName=job_name,
+                Media={'MediaFileUri': s3_uri},
+                MediaFormat=media_format,
+                LanguageCode='en-US',
+                Settings=transcribe_settings,
+                OutputBucketName=S3_BUCKET,
+                OutputKey=output_s3_prefix,
+            )
+
+            print(f"Transcription job '{job_name}' started successfully")
+            results.append({
+                'status': 'started',
+                'jobName': job_name,
+                'session_id': session_id,
+                'driver_folder': driver_folder,
+                'inputFile': input_key,
+                'outputPrefix': f"s3://{S3_BUCKET}/{output_s3_prefix}"
+            })
+
+            record_audit_event('TRANSCRIBE_START', 'pipeline', session_id, 'system', {
+                'job_name': job_name,
+                'driver_folder': driver_folder,
+                'input_file': input_key
+            })
+
+        except Exception as e:
+            print(f"ERROR starting transcription job for {s3_uri}: {e}")
+            results.append({
+                'status': 'error',
+                'file': input_key,
+                'error': str(e)
+            })
+            record_audit_event('TRANSCRIBE_START_FAILED', 'pipeline', session_id, 'system', {
+                'job_name': job_name,
+                'driver_folder': driver_folder,
+                'input_file': input_key,
+                'error': str(e)
+            })
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(results)
+    }
+
+

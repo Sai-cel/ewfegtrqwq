@@ -1,0 +1,15 @@
+# Andretti Streaming Audio Ingester Dependencies
+# Python 3.9+
+#
+# This extends the base ecs-ingester requirements with
+# Amazon Transcribe Streaming SDK for real-time transcription.
+
+# AWS SDK (same as ecs-ingester)
+boto3>=1.26.0
+
+# Amazon Transcribe Streaming SDK
+# Required for real-time streaming transcription
+amazon-transcribe>=0.6.0
+
+# Async HTTP (used by Transcribe Streaming SDK)
+aiohttp>=3.8.0

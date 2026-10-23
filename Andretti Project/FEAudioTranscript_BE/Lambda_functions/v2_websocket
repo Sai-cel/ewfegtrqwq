@@ -1,0 +1,611 @@
+########### 16/07/2026 #########
+import json
+import urllib.request
+import base64
+import boto3
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+import traceback
+import os
+import time
+import uuid
+from datetime import datetime
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "https://search-andretti-fe-dev-to-indexing-tpuwdbzpfw6jz5g4z5rou2ab5q.aos.us-west-2.on.aws")
+INDEX_NAME = os.environ.get("OPENSEARCH_INDEX", "v2_transcriptions")
+def _get_opensearch_credentials():
+    client = boto3.client("secretsmanager", region_name="us-west-2")
+    response = client.get_secret_value(SecretId="andretti/opensearch-credentials")
+    return json.loads(response["SecretString"])
+
+_creds = _get_opensearch_credentials()
+USERNAME = _creds["username"]
+PASSWORD = _creds["password"]
+S3_BUCKET = os.environ.get("S3_BUCKET", "v2-andretti-transcription-system")
+SILENCE_REMOVED_PREFIX = os.environ.get("SILENCE_REMOVED_PREFIX", "silence-removed/")
+CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE", "v2_websocket-connections")
+ACTIVE_SESSIONS_TABLE = os.environ.get("ACTIVE_SESSIONS_TABLE", "v2_ActiveSessions")
+KEYWORDS_CONFIG_TABLE = os.environ.get("KEYWORDS_CONFIG_TABLE", "v2_KeywordsConfig")
+LIVE_CONVERSATION_WINDOW_SECONDS = int(os.environ.get("LIVE_CONVERSATION_WINDOW_SECONDS", "120"))
+RELEVANT_MESSAGES_TABLE = os.environ.get("RELEVANT_MESSAGES_TABLE", "RelavantMessages")
+SESSION_GRACE_PERIOD_MINUTES = int(os.environ.get("SESSION_GRACE_PERIOD_MINUTES", "2"))
+print("=" * 60)
+print("WEBSOCKET LAMBDA INITIALIZED")
+print("=" * 60)
+print(f"CONNECTIONS_TABLE: {CONNECTIONS_TABLE}")
+print(f"ACTIVE_SESSIONS_TABLE: {ACTIVE_SESSIONS_TABLE}")
+print(f"OPENSEARCH_URL: {OPENSEARCH_URL}")
+print(f"INDEX_NAME: {INDEX_NAME}")
+print(f"S3_BUCKET: {S3_BUCKET}")
+print(f"SILENCE_REMOVED_PREFIX: {SILENCE_REMOVED_PREFIX}")
+print("=" * 60)
+dynamodb = boto3.resource('dynamodb')
+connections_table = dynamodb.Table(CONNECTIONS_TABLE)
+active_sessions_table = dynamodb.Table(ACTIVE_SESSIONS_TABLE)
+print(f"DynamoDB connections table initialized: {connections_table.table_name}")
+print(f"DynamoDB active sessions table initialized: {active_sessions_table.table_name}")
+
+AUDIT_S3_BUCKET = os.environ.get('AUDIT_S3_BUCKET', 'test-v2-andretti-audit-logs')
+AUDIT_S3_PREFIX = os.environ.get('AUDIT_S3_PREFIX', 'audit-logs/')
+SESSION_LOGS_PREFIX = os.environ.get('SESSION_LOGS_PREFIX', 'session_logs/')
+SYSTEM_LOGS_PREFIX = os.environ.get('SYSTEM_LOGS_PREFIX', 'system_logs/')
+SESSION_SCOPED_ENTITIES = {'pipeline', 'session', 'session_config', 'recording'}
+audit_s3 = boto3.client('s3')
+
+
+def record_audit_event(action, entity, entity_id, created_by, details=None):
+    """Write an audit-trail record to S3 in three places: a date partition
+    (unchanged), session_logs/{session_id}/ for session-scoped events
+    (WEBSOCKET_SEARCH, entity='pipeline'), or system_logs/YYYY/MM/DD/ for
+    everything else (connect/disconnect/error, entity='websocket', keyed by
+    connection_id). No-op if AUDIT_S3_BUCKET is unset; never raises."""
+    if not AUDIT_S3_BUCKET:
+        return
+    try:
+        now = datetime.utcnow()
+        record = {
+            'audit_id': str(uuid.uuid4()),
+            'timestamp': now.isoformat() + 'Z',
+            'action': action,
+            'entity': entity,
+            'entity_id': str(entity_id) if entity_id is not None else '',
+            'created_by': created_by or 'unknown',
+            'details': details or {}
+        }
+        suffix = f"{action}_{int(now.timestamp())}_{record['audit_id'][:8]}.json"
+        body = json.dumps(record, default=str).encode('utf-8')
+        date_path = now.strftime('%Y/%m/%d')
+        audit_s3.put_object(
+            Bucket=AUDIT_S3_BUCKET,
+            Key=f"{AUDIT_S3_PREFIX}{date_path}/{suffix}",
+            Body=body,
+            ContentType='application/json'
+        )
+        if entity in SESSION_SCOPED_ENTITIES and record['entity_id']:
+            audit_s3.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SESSION_LOGS_PREFIX}{record['entity_id']}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+        else:
+            audit_s3.put_object(
+                Bucket=AUDIT_S3_BUCKET,
+                Key=f"{SYSTEM_LOGS_PREFIX}{date_path}/{suffix}",
+                Body=body,
+                ContentType='application/json'
+            )
+    except Exception as e:
+        print(f"[AUDIT] Failed to record {action} for {entity}:{entity_id}: {e}")
+def get_latest_session_from_opensearch():
+    """Fallback: Get the most recent SessionId from OpenSearch"""
+    try:
+        credentials = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+        url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+        payload = {
+            "size": 1,
+            "sort": [{"Timestamp": {"order": "desc"}}],
+            "_source": ["SessionId"]
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {credentials}"
+            },
+            method="POST"
+        )
+        res = urllib.request.urlopen(req)
+        data = json.loads(res.read().decode())
+        hits = data.get("hits", {}).get("hits", [])
+        if hits:
+            return hits[0].get("_source", {}).get("SessionId")
+        return None
+    except Exception as e:
+        print(f"[SESSION_CHECK] OpenSearch fallback error: {e}")
+        return None
+def get_valid_session_for_display():
+    """
+    Get a valid session for display based on ECS status and grace period.
+    Logic:
+    - If Status = ACTIVE → return session (ECS is running)
+    - If Status = STOPPED and within grace period → return session
+    - If Status = STOPPED and grace period expired → fallback to OpenSearch
+    - If no ActiveSessions entry → fallback to latest from OpenSearch
+    Always returns a session ID if any transcriptions exist in OpenSearch.
+    """
+    try:
+        response = active_sessions_table.scan()
+        sessions = response.get('Items', [])
+        if not sessions:
+            print("[SESSION_CHECK] No sessions in v2_ActiveSessions table - fallback to OpenSearch")
+            return get_latest_session_from_opensearch()
+        latest_session = max(sessions, key=lambda x: int(x.get('UpdatedAt', 0)))
+        session_id = latest_session.get('SessionId')
+        status = latest_session.get('Status')
+        print(f"[SESSION_CHECK] Session: {session_id}, Status: {status}")
+        if status == 'ACTIVE':
+            print(f"[SESSION_CHECK] Session {session_id} is ACTIVE - valid")
+            return session_id
+        if status == 'STOPPED':
+            stopped_at = int(latest_session.get('StoppedAt', 0))
+            current_time = int(time.time())
+            time_since_stopped = current_time - stopped_at
+            grace_period_seconds = SESSION_GRACE_PERIOD_MINUTES * 60
+            print(f"[SESSION_CHECK] StoppedAt: {stopped_at}")
+            print(f"[SESSION_CHECK] Time since stopped: {time_since_stopped} seconds")
+            if time_since_stopped <= grace_period_seconds:
+                remaining = grace_period_seconds - time_since_stopped
+                print(f"[SESSION_CHECK] Within grace period - {remaining} seconds remaining")
+                return session_id
+            else:
+                print(f"[SESSION_CHECK] Grace period expired - returning None to stop display")
+                return None
+        return get_latest_session_from_opensearch()
+    except Exception as e:
+        print(f"[SESSION_CHECK] Error: {e}")
+        traceback.print_exc()
+        return get_latest_session_from_opensearch()
+def _extract_chunk_key_from_audio_path(audio_s3_path):
+    """From a stored audio_s3_path (raw s3:// URI, presigned URL, or even a
+    malformed s3://bucket/https://... string), return (driver_folder, source_file)
+    by locating the silence-removed/ marker and taking the path tail.
+    Returns (None, None) if the path doesn't include the marker."""
+    if not audio_s3_path:
+        return (None, None)
+    s = str(audio_s3_path).split('?')[0]
+    idx = s.rfind(SILENCE_REMOVED_PREFIX)
+    if idx == -1:
+        return (None, None)
+    tail = s[idx + len(SILENCE_REMOVED_PREFIX):]
+    parts = tail.split('/')
+    if len(parts) >= 3:
+        return (parts[1], parts[2])
+    if len(parts) >= 2:
+        return (parts[0], parts[1])
+    return (None, None)
+def get_relevant_message_lookup(session_id):
+    """Build two lookups for relevant messages in this session. Two keys so the
+    match works even if the frontend posted a malformed audio_s3_key:
+      lookup_by_file: (driver_folder, source_file) -> message_id
+      lookup_by_time: (driver_name,  time_string)  -> message_id
+    The search handler checks both and uses whichever hits first."""
+    if not session_id:
+        return {}, {}
+    try:
+        rm_table = dynamodb.Table(RELEVANT_MESSAGES_TABLE)
+        resp = rm_table.query(
+            KeyConditionExpression=Key('SessionId').eq(session_id),
+            ConsistentRead=True
+        )
+        items = resp.get('Items', [])
+    except Exception as e:
+        print(f"[REL_LOOKUP] Error querying {RELEVANT_MESSAGES_TABLE}: {e}")
+        return {}, {}
+    lookup_by_file = {}
+    lookup_by_time = {}
+    for item in items:
+        if item.get('is_relevant') is False:
+            continue
+        msg_id = item.get('MessageId')
+        driver_name = item.get('driver')
+        time_str = item.get('time')
+        if driver_name and time_str:
+            lookup_by_time[(str(driver_name), str(time_str))] = msg_id
+        stored_driver_id = item.get('driver_id')
+        stored_source_file = item.get('source_file')
+        if stored_driver_id and stored_source_file:
+            lookup_by_file[(str(stored_driver_id), str(stored_source_file))] = msg_id
+        parsed_driver, parsed_file = _extract_chunk_key_from_audio_path(item.get('audio_s3_path'))
+        if parsed_driver and parsed_file and (parsed_driver, parsed_file) not in lookup_by_file:
+            lookup_by_file[(parsed_driver, parsed_file)] = msg_id
+        print(f"[REL_LOOKUP] item MessageId={msg_id} driver='{driver_name}' driver_id='{stored_driver_id}' "
+              f"source_file='{stored_source_file}' time='{time_str}' audio_path='{item.get('audio_s3_path')}' "
+              f"parsed=({parsed_driver}, {parsed_file})")
+    print(f"[REL_LOOKUP] Built {len(lookup_by_file)} by-file + {len(lookup_by_time)} by-time entries for session {session_id}")
+    return lookup_by_file, lookup_by_time
+def get_keywords_config():
+    """Get active keywords configuration for highlighting"""
+    try:
+        keywords_table = dynamodb.Table(KEYWORDS_CONFIG_TABLE)
+        response = keywords_table.scan()
+        items = response.get('Items', [])
+        active_configs = [c for c in items if c.get('is_active', True)]
+        if active_configs:
+            return active_configs[0].get('keywords', [])
+        return []
+    except Exception as e:
+        print(f"[KEYWORDS] Error fetching keywords config: {e}")
+        return []
+def save_connection(connection_id, domain_name=None, stage=None):
+    """Save WebSocket connection to DynamoDB"""
+    try:
+        item = {
+            'connectionId': connection_id,
+            'connectedAt': str(int(time.time()))
+        }
+        if domain_name:
+            item['domainName'] = str(domain_name)
+        if stage:
+            item['stage'] = str(stage)
+        connections_table.put_item(Item=item)
+        return True
+    except Exception as e:
+        print(f"[SAVE_CONNECTION] Error: {e}")
+        return False
+def remove_connection(connection_id):
+    """Remove WebSocket connection from DynamoDB"""
+    try:
+        connections_table.delete_item(Key={'connectionId': connection_id})
+        print(f"[REMOVE_CONNECTION] SUCCESS - Removed: {connection_id}")
+        return True
+    except Exception as e:
+        print(f"[REMOVE_CONNECTION] Error: {e}")
+        return False
+def get_all_connections():
+    """Get all active WebSocket connections from DynamoDB"""
+    try:
+        response = connections_table.scan()
+        connections = response.get('Items', [])
+        connection_ids = [conn['connectionId'] for conn in connections]
+        print(f"[GET_CONNECTIONS] Found {len(connection_ids)} active connections")
+        return connection_ids
+    except Exception as e:
+        print(f"[GET_CONNECTIONS] Error: {e}")
+        return []
+def get_connection_connected_at(connection_id):
+    """Return connection start epoch (seconds), or 0 when unavailable."""
+    try:
+        row = connections_table.get_item(Key={'connectionId': connection_id}).get('Item') or {}
+        return int(row.get('connectedAt', 0) or 0)
+    except Exception as e:
+        print(f"[GET_CONNECTED_AT] Error for {connection_id}: {e}")
+        return 0
+def safe_post(apigw_client, connection_id, payload):
+    """Safely send message to WebSocket connection"""
+    if not apigw_client:
+        return False
+    try:
+        apigw_client.post_to_connection(
+            ConnectionId=connection_id,
+            Data=json.dumps(payload).encode("utf-8")
+        )
+        return True
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ["GoneException", "ForbiddenException", "BadRequestException"]:
+            remove_connection(connection_id)
+        return False
+    except Exception as e:
+        print(f"[WS_POST] Error: {e}")
+        return False
+def lambda_handler(event, context):
+    print("=" * 60)
+    print("[HANDLER] === LAMBDA STARTED ===")
+    print("=" * 60)
+    print("[HANDLER] EVENT:", json.dumps(event, indent=2))
+    apigw_client = None
+    connection_id = None
+    try:
+        if "requestContext" not in event:
+            print("[HANDLER] ERROR: No requestContext in event")
+            return {"statusCode": 400, "body": "Not WebSocket event"}
+        rc = event["requestContext"]
+        connection_id = rc.get("connectionId")
+        domain_name = rc.get("domainName")
+        stage = rc.get("stage")
+        route_key = rc.get("routeKey")
+        print("[HANDLER] Request Context Details:")
+        print(f"[HANDLER]   - Route Key: {route_key}")
+        print(f"[HANDLER]   - Connection ID: {connection_id}")
+        print(f"[HANDLER]   - Domain Name: {domain_name}")
+        print(f"[HANDLER]   - Stage: {stage}")
+        ws_user = (event.get("queryStringParameters") or {}).get("user") \
+            or (event.get("queryStringParameters") or {}).get("username") or "unknown"
+        if route_key == "$connect":
+            print("=" * 50)
+            print("[HANDLER] === HANDLING $connect ===")
+            result = save_connection(connection_id, domain_name, stage)
+            if result:
+                record_audit_event('WEBSOCKET_CONNECT', 'websocket', connection_id, ws_user,
+                                    {'domain': domain_name, 'stage': stage})
+                # Send only session-state sync here. Avoid sending a full search
+                # snapshot on connect because frontend also requests it, which
+                # causes duplicated rows after page refresh.
+                try:
+                    endpoint = f"https://{domain_name}/{stage}"
+                    apigw_client = boto3.client("apigatewaymanagementapi", endpoint_url=endpoint)
+                    time.sleep(0.2)
+                    valid_session = get_valid_session_for_display()
+                    if valid_session:
+                        safe_post(apigw_client, connection_id, {
+                            "message_type": "session_started",
+                            "session_id": valid_session,
+                            "action": "refresh_now",
+                            "source": "connect_sync"
+                        })
+                    else:
+                        safe_post(apigw_client, connection_id, {
+                            "message_type": "no_active_session",
+                            "message": "No active session",
+                            "source": "connect_sync"
+                        })
+                except Exception as sync_error:
+                    print(f"[HANDLER] $connect sync skipped due to error: {sync_error}")
+                print("[HANDLER] $connect SUCCESS - Connection saved")
+                return {"statusCode": 200, "body": "Connected"}
+            print("[HANDLER] $connect FAILED - Could not save connection")
+            return {"statusCode": 500, "body": "Failed to save connection"}
+        if route_key == "$disconnect":
+            print("=" * 50)
+            print("[HANDLER] === HANDLING $disconnect ===")
+            remove_connection(connection_id)
+            record_audit_event('WEBSOCKET_DISCONNECT', 'websocket', connection_id, 'system')
+            return {"statusCode": 200, "body": "Disconnected"}
+        endpoint = f"https://{domain_name}/{stage}"
+        print(f"[HANDLER] Setting up API Gateway client")
+        print(f"[HANDLER] Endpoint: {endpoint}")
+        apigw_client = boto3.client("apigatewaymanagementapi", endpoint_url=endpoint)
+        print("[HANDLER] API Gateway client created successfully")
+        s3_client = boto3.client("s3")
+        print("[HANDLER] S3 client created successfully")
+        body = json.loads(event.get("body", "{}"))
+        print(f"[HANDLER] Parsed body: {json.dumps(body)}")
+        if "query" in body:
+            print(f"[HANDLER] Query detected: {body.get('query')}")
+            return handle_search(apigw_client, connection_id, body, s3_client)
+        if body.get("action") == "get_keywords":
+            print("[HANDLER] get_keywords action detected")
+            keywords = get_keywords_config()
+            safe_post(apigw_client, connection_id, {
+                "message_type": "keywords_config",
+                "keywords": keywords
+            })
+            return {"statusCode": 200}
+        print("[HANDLER] No recognized command in body")
+        safe_post(apigw_client, connection_id, {"error": "Unknown command"})
+        return {"statusCode": 200}
+    except Exception as e:
+        print("=" * 60)
+        print(f"[HANDLER] EXCEPTION: {type(e).__name__}: {e}")
+        print("=" * 60)
+        traceback.print_exc()
+        record_audit_event('WEBSOCKET_ERROR', 'websocket', connection_id or 'unknown', 'system',
+                            {'error': f"{type(e).__name__}: {e}"})
+        if apigw_client and connection_id:
+            safe_post(apigw_client, connection_id, {"error": "Internal server error"})
+        return {"statusCode": 500}
+# ---- batched-send config for handle_search (the fix) ----
+BATCH_SIZE = 100  # max messages per bundle
+MAX_BATCH_BYTES = 120000  # ~120 KB safety cap (WebSocket hard limit is 128 KB)
+def handle_search(apigw_client, connection_id, body, s3_client):
+    """Handle search queries from frontend (batched send)."""
+    print("=" * 60)
+    print("[SEARCH] === HANDLE SEARCH START ===")
+    print("=" * 60)
+    query = body.get("query") or "*"
+    valid_session = get_valid_session_for_display()
+    print(f"[SEARCH] Query: {query} | SessionId: {valid_session}")
+    if not valid_session:
+        safe_post(apigw_client, connection_id, {
+            "message_type": "no_active_session",
+            "message": "No active session"
+        })
+        return {"statusCode": 200}
+    payload = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"query_string": {"query": query, "default_operator": "AND"}},
+                    {"match_phrase": {"SessionId": valid_session}}
+                ],
+                "must_not": [
+                    {"wildcard": {"SourceFile": "*_recorded*"}}
+                ]
+            }
+        },
+        "size": 5000
+    }
+    credentials = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
+    url = f"{OPENSEARCH_URL}/{INDEX_NAME}/_search"
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Basic {credentials}"
+            },
+            method="POST"
+        )
+        res = urllib.request.urlopen(req)
+        data = json.loads(res.read().decode())
+        hits = data.get("hits", {}).get("hits", [])
+        print(f"[SEARCH] OpenSearch returned {len(hits)} hits")
+    except Exception as e:
+        print(f"[SEARCH] OpenSearch ERROR: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        safe_post(apigw_client, connection_id, {"error": str(e)})
+        return {"statusCode": 200}
+    if not hits:
+        safe_post(apigw_client, connection_id, {"message_type": "no_results"})
+        return {"statusCode": 200}
+    def _session_time_seconds(h):
+        st = h.get("_source", {}).get("SessionTime")
+        if not st:
+            return 0
+        s = str(st).strip()
+        negative = s.startswith("-")
+        if negative:
+            s = s[1:]
+        try:
+            parts = list(map(int, s.split(":")))
+        except (ValueError, AttributeError):
+            return 0
+        if len(parts) == 2:
+            total = parts[0] * 60 + parts[1]
+        elif len(parts) == 3:
+            total = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        else:
+            return 0
+        return -total if negative else total
+    hits = sorted(
+        hits,
+        key=lambda h: (_session_time_seconds(h),
+                       float(h.get("_source", {}).get("Timestamp", 0) or 0))
+    )
+    print(f"[SEARCH] Sorted {len(hits)} results by race order")
+    prerace_buffer = 0
+    try:
+        active_item = active_sessions_table.get_item(
+            Key={'SessionId': valid_session},
+            ConsistentRead=True
+        ).get('Item') or {}
+        started_at = int(active_item.get('StartedAt', 0) or 0)
+        race_start_ts = int(active_item.get('RaceStartAt', 0) or 0)
+        if started_at and race_start_ts:
+            prerace_buffer = race_start_ts - started_at
+    except Exception as e:
+        print(f"[SEARCH] Could not look up active session times ({e})")
+    def format_race_relative(stored_session_time):
+        if not stored_session_time:
+            return "00:00"
+        try:
+            parts = list(map(int, str(stored_session_time).split(":")))
+        except (ValueError, AttributeError):
+            return str(stored_session_time)
+        if len(parts) == 2:
+            raw_seconds = parts[0] * 60 + parts[1]
+        elif len(parts) == 3:
+            raw_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        else:
+            return str(stored_session_time)
+        delta = raw_seconds - prerace_buffer
+        sign = "-" if delta < 0 else ""
+        abs_delta = abs(delta)
+        hours = abs_delta // 3600
+        minutes = (abs_delta % 3600) // 60
+        seconds = abs_delta % 60
+        if hours > 0:
+            return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{sign}{minutes:02d}:{seconds:02d}"
+    relevant_lookup_by_file, relevant_lookup_by_time = get_relevant_message_lookup(valid_session)
+    # -------- build all rows, then send in BATCHES (the fix) --------
+    # Batches are capped by BOTH message count AND byte size, so a bundle can
+    # never exceed the WebSocket frame limit (~128 KB) even if messages are long.
+    batch = []
+    batch_bytes = 0
+    sent = 0
+    def _flush():
+        nonlocal batch, batch_bytes, sent
+        if not batch:
+            return
+        payload = {
+            "message_type": "search_result_batch",
+            "results": batch
+        }
+        # PREVIOUS BUG: the result of safe_post() was ignored and `sent` was
+        # incremented regardless. If API Gateway throttled or rejected a batch,
+        # those 100 messages were silently lost AND the log still claimed
+        # success. On long sessions (many batches) this cut the conversation
+        # off partway with no error anywhere.
+        ok = False
+        for attempt in range(5):
+            ok = safe_post(apigw_client, connection_id, payload)
+            if ok:
+                break
+            wait = 0.2 * (attempt + 1)
+            print(f"[SEARCH] Batch send failed (attempt {attempt + 1}/5) - retrying in {wait:.1f}s")
+            time.sleep(wait)
+        if ok:
+            sent += len(batch)
+        else:
+            print(f"[SEARCH] BATCH FAILED after 5 retries - {len(batch)} messages LOST")
+        batch = []
+        batch_bytes = 0
+        # Small pause between batches so rapid-fire posts do not trip API
+        # Gateway rate limits on long sessions.
+        time.sleep(0.05)
+    for i, hit in enumerate(hits):
+        src = hit["_source"]
+        session_id = src.get("SessionId", "")
+        driver_folder = src.get("DriverId", "")
+        source_file = src.get("SourceFile", "")
+        if session_id and driver_folder and source_file:
+            mp3_key = f"{SILENCE_REMOVED_PREFIX}{session_id}/{driver_folder}/{source_file}"
+        elif driver_folder and source_file:
+            mp3_key = f"{SILENCE_REMOVED_PREFIX}{driver_folder}/{source_file}"
+        else:
+            mp3_key = f"{SILENCE_REMOVED_PREFIX}{source_file}"
+        try:
+            audio_url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": S3_BUCKET, "Key": mp3_key},
+                ExpiresIn=3600
+            )
+        except Exception as e:
+            print(f"[SEARCH] Presigned URL failed: {e}")
+            audio_url = None
+        segments_data = src.get("Segments", [])
+        if not segments_data:
+            segments_data = [{"role": "Unknown", "text": src.get("Message", "")}]
+        formatted_time = format_race_relative(src.get("SessionTime"))
+        time_seconds = _session_time_seconds(hit) - prerace_buffer
+        driver_name = src.get("Driver")
+        by_file_match = relevant_lookup_by_file.get((driver_folder, source_file))
+        by_time_match = relevant_lookup_by_time.get(
+            (str(driver_name) if driver_name else "", formatted_time))
+        relevant_message_id = by_file_match or by_time_match
+        row = {
+            "message_type": "search_result",
+            "team": src.get("Team"),
+            "driver": driver_name,
+            "driver_id": driver_folder,
+            "speaker": src.get("Speaker"),
+            "time": formatted_time,
+            "time_seconds": time_seconds,
+            "message": segments_data,
+            "audio_url": audio_url,
+            "chunk_id": f"chunk_{i}",
+            "source_file": source_file,
+            "is_relevant": relevant_message_id is not None,
+            "relevant_message_id": relevant_message_id,
+            "expires_in_seconds": LIVE_CONVERSATION_WINDOW_SECONDS
+        }
+        # Size of this row as JSON bytes. If adding it would push the current
+        # batch over the byte cap, flush first so no batch exceeds the limit.
+        row_bytes = len(json.dumps(row).encode("utf-8"))
+        if batch and (batch_bytes + row_bytes) > MAX_BATCH_BYTES:
+            _flush()
+        batch.append(row)
+        batch_bytes += row_bytes
+        # Also flush on the message-count cap.
+        if len(batch) >= BATCH_SIZE:
+            _flush()
+    _flush()  # send any leftover rows
+    print(f"[SEARCH] All {sent} results sent in batches - sending done status")
+    safe_post(apigw_client, connection_id, {"status": "done"})
+    record_audit_event('WEBSOCKET_SEARCH', 'pipeline', valid_session, 'system',
+                        {'query': query, 'hits': len(hits), 'sent': sent})
+    print("[SEARCH] === HANDLE SEARCH COMPLETE ===")
+    return {"statusCode": 200}
